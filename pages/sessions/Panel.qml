@@ -359,7 +359,9 @@ Panel {
             readonly property bool current: index === root.selectedIndex
 
             width: sessionList.width
-            height: rowContent.implicitHeight + Style.space(16)
+            height: rowContent.implicitHeight
+              + (rowControls.visible ? rowControls.height + Style.space(6) : 0)
+              + Style.space(16)
             radius: Style.cornerRadius
             color: (current || rowArea.containsMouse)
               ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
@@ -404,13 +406,12 @@ Panel {
 
             Column {
               id: rowContent
-              // Above the row-wide MouseArea so the control pills get clicks.
-              z: 1
               anchors.left: badge.right
               anchors.leftMargin: Style.space(12)
               anchors.right: rowAge.left
               anchors.rightMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(8)
               spacing: Style.space(2)
 
               Text {
@@ -447,66 +448,74 @@ Panel {
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.caption
               }
+            }
 
-              // Sub-controls, shown on the selected row.
-              Row {
-                visible: row.current
-                spacing: Style.space(6)
-                topPadding: Style.space(4)
+            // Sub-controls, shown on the selected row. They span the whole row
+            // under the badge and text, and wrap rather than run off the edge.
+            Flow {
+              id: rowControls
+              // Above the row-wide MouseArea so the control pills get clicks.
+              z: 1
+              visible: row.current
+              anchors.top: rowContent.bottom
+              anchors.topMargin: Style.space(6)
+              anchors.left: badge.left
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(16)
+              spacing: Style.space(6)
 
-                Repeater {
-                  model: {
-                    if (!row.current) return []
-                    var acts = [{key: "resume", label: "↵ Resume", danger: false}]
-                    if (row.modelData.canPeek)
-                      acts.push({key: "peek", label: "p Peek", danger: false})
-                    acts.push({key: "folder", label: "o Folder", danger: false})
-                    acts.push({key: "copy",
-                      label: root.copiedIndex === row.index ? "✓ Copied" : "y Copy ID",
-                      danger: false})
-                    if (row.modelData.canDelete)
-                      acts.push({key: "delete",
-                        label: root.confirmingDelete ? "d Sure?" : "d Delete",
-                        danger: true})
-                    return acts
+              Repeater {
+                model: {
+                  if (!row.current) return []
+                  var acts = [{key: "resume", label: "↵ Resume", danger: false}]
+                  if (row.modelData.canPeek)
+                    acts.push({key: "peek", label: "p Peek", danger: false})
+                  acts.push({key: "folder", label: "o Folder", danger: false})
+                  acts.push({key: "copy",
+                    label: root.copiedIndex === row.index ? "✓ Copied" : "y Copy ID",
+                    danger: false})
+                  if (row.modelData.canDelete)
+                    acts.push({key: "delete",
+                      label: root.confirmingDelete ? "d Sure?" : "d Delete",
+                      danger: true})
+                  return acts
+                }
+
+                Rectangle {
+                  required property var modelData
+                  width: ctlText.implicitWidth + Style.space(16)
+                  height: ctlText.implicitHeight + Style.space(8)
+                  radius: height / 2
+                  color: ctlArea.containsMouse
+                    ? (modelData.danger && root.confirmingDelete
+                      ? Color.urgent : Color.accent)
+                    : "transparent"
+                  border.width: 1
+                  border.color: modelData.danger && root.confirmingDelete
+                    ? Color.urgent : root.faint
+
+                  Text {
+                    id: ctlText
+                    anchors.centerIn: parent
+                    text: parent.modelData.label
+                    textFormat: Text.PlainText
+                    color: ctlArea.containsMouse ? Color.background
+                      : (parent.modelData.danger && root.confirmingDelete
+                        ? Color.urgent : root.dimmed)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
                   }
 
-                  Rectangle {
-                    required property var modelData
-                    width: ctlText.implicitWidth + Style.space(16)
-                    height: ctlText.implicitHeight + Style.space(8)
-                    radius: height / 2
-                    color: ctlArea.containsMouse
-                      ? (modelData.danger && root.confirmingDelete
-                        ? Color.urgent : Color.accent)
-                      : "transparent"
-                    border.width: 1
-                    border.color: modelData.danger && root.confirmingDelete
-                      ? Color.urgent : root.faint
-
-                    Text {
-                      id: ctlText
-                      anchors.centerIn: parent
-                      text: parent.modelData.label
-                      textFormat: Text.PlainText
-                      color: ctlArea.containsMouse ? Color.background
-                        : (parent.modelData.danger && root.confirmingDelete
-                          ? Color.urgent : root.dimmed)
-                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                      font.pixelSize: Style.font.caption
-                    }
-
-                    MouseArea {
-                      id: ctlArea
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: {
-                        var key = parent.modelData.key
-                        if (key === "resume") root.resumeSession(row.modelData)
-                        else if (key === "delete") root.requestDelete()
-                        else root.runAction(key, row.modelData)
-                      }
+                  MouseArea {
+                    id: ctlArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      var key = parent.modelData.key
+                      if (key === "resume") root.resumeSession(row.modelData)
+                      else if (key === "delete") root.requestDelete()
+                      else root.runAction(key, row.modelData)
                     }
                   }
                 }
@@ -517,7 +526,7 @@ Panel {
               id: rowAge
               anchors.right: parent.right
               anchors.rightMargin: Style.space(16)
-              anchors.verticalCenter: parent.verticalCenter
+              anchors.verticalCenter: rowContent.verticalCenter
               text: root.fmtAge(modelData.mtime)
               color: root.dimmed
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -562,8 +571,10 @@ Panel {
 
           Text {
             id: footerHints
-            anchors.right: parent.right
+            width: parent.width
             anchors.verticalCenter: parent.verticalCenter
+            horizontalAlignment: Text.AlignRight
+            wrapMode: Text.WordWrap
             text: "↵ resume · p peek · o folder · y copy · d delete ×2 · ←/→ agent · r rescan · esc"
             color: root.dimmed
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
