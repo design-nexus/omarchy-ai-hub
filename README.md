@@ -12,6 +12,8 @@ One Omarchy bar icon for your AI tooling. Click it for a tabbed panel with five 
 
 The panel always opens on Usage.
 
+![AI Hub panel on the Usage tab, showing Claude Code's usage today, quota limits, models and the last seven days](assets/screenshots/ai-hub-panel.png)
+
 ## The bar icon
 
 - Coloured dots around the icon pulse for each agent with a live session.
