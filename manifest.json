@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "design-nexus.ai-hub",
+  "name": "AI Hub",
+  "version": "1.0.0",
+  "author": "Design Nexus",
+  "license": "MIT",
+  "description": "One bar icon for AI tooling: usage and quotas, live herdr agents, past sessions, loaded skills, and the LM Studio server. Combines design-nexus.ai-usage, jankeesvw.herdr, sid.sessions, oliwier.agent-skills-manager and design-nexus.lmstudio.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "AiHub.qml" },
+  "barWidget": {
+    "displayName": "AI Hub",
+    "description": "Usage, live agents, sessions, skills and LM Studio behind one icon. Left click opens, right click jumps to LM Studio, middle click refreshes.",
+    "category": "AI",
+    "aliases": ["ai", "agents", "usage", "sessions", "skills", "herdr", "lmstudio", "claude", "codex"],
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": { "defaultPage": "usage" },
+    "schema": [
+      {
+        "key": "defaultPage",
+        "type": "enum",
+        "label": "Tab shown first",
+        "options": ["usage", "live", "sessions", "skills", "lmstudio"],
+        "defaultValue": "usage",
+        "description": "Per-tab settings live in nested objects (usage, live, sessions, skills, lmstudio) in this widget's shell.json entry."
+      }
+    ]
+  }
+}

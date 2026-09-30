@@ -1,0 +1,6 @@
+singleton HubStyle 1.0 HubStyle.qml
+HubHero 1.0 HubHero.qml
+HubPill 1.0 HubPill.qml
+HubSection 1.0 HubSection.qml
+EmbeddedPanel 1.0 EmbeddedPanel.qml
+PageBar 1.0 PageBar.qml
