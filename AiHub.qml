@@ -23,8 +23,7 @@ BarWidget {
     usage: "Usage", live: "Live", sessions: "Sessions", skills: "Skills", lmstudio: "LM Studio"
   })
 
-  property string currentKey: pageKeys.indexOf(String(setting("defaultPage", "usage"))) >= 0
-    ? String(setting("defaultPage", "usage")) : "usage"
+  property string currentKey: "usage"
   property bool popupOpen: false
   property bool popoutSwitchClosing: false
   property bool switching: false
@@ -134,8 +133,10 @@ BarWidget {
 
   // ------------------------------------------------------------ open / close
 
+  // Every fresh open lands on Usage; showPage() is the way to another tab.
   function open() {
     if (popupOpen) return
+    currentKey = "usage"
     popupOpen = true
     openPage(currentKey)
   }
@@ -158,16 +159,13 @@ BarWidget {
 
   function showPage(key) {
     if (pageKeys.indexOf(key) < 0) return
-    if (key === currentKey) {
-      open()
-      return
-    }
+    if (key === currentKey && popupOpen) return
     switching = true
-    if (popupOpen) closePage(currentKey)
+    if (popupOpen && key !== currentKey) closePage(currentKey)
     currentKey = key
     switching = false
-    if (popupOpen) openPage(key)
-    else open()
+    popupOpen = true
+    openPage(key)
     Qt.callLater(focusActive)
   }
 
