@@ -1,0 +1,2364 @@
+#!/usr/bin/env python3
+"""agent-skills — the only part of Agent Skills Manager that touches the filesystem.
+
+One line of JSON on stdout, diagnostics on stderr. The QML reads and draws; it does
+no I/O of its own beyond spawning this. Every subcommand is runnable by hand, which
+is the point: an action you cannot reproduce in a terminal is one you cannot debug.
+
+READ-ONLY over everything that is not this program's own. It reports what Claude
+Code, OpenCode and Codex load and what that costs, and it writes exactly two files,
+both under ~/.config/agent-skills: the categories you filed things under, and the
+notes you wrote for yourself. No skill's SKILL.md is ever opened for writing, no
+agent's configuration file is touched, nothing is deleted or moved, and no other
+program is started -- this file spawns nothing at all.
+
+Exit codes: 0 done · 1 usage error · 2 refused, nothing written. There is no partial-write
+code because there is no partial write: the store is built whole, fsynced, and renamed over
+the old one, so a failed write leaves the previous file exactly as it was.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import sys
+import time
+
+VERSION = "1.0.0"
+HOME = os.path.expanduser("~")
+
+# A skill's SKILL.md is prose. Anything larger than this is not a skill, it is a
+# mistake or an attack, and we refuse to read it into memory to find out which.
+MAX_READ = 1024 * 1024
+FRONTMATTER_LIMIT = 64 * 1024
+
+# Everything below bounds what can cross into the shell process. Quickshell runs
+# the whole desktop in one process and StdioCollector has no size cap of its own,
+# so the ceiling has to be here, on the producing side, before the bytes exist.
+MAX_OUTPUT = 2 * 1024 * 1024
+MAX_ITEMS = 2000
+MAX_DIR_ENTRIES = 2000
+DEADLINE_SECONDS = 20.0
+
+
+# ---------------------------------------------------------------- safe reading
+
+def _refused(why: list | None, reason: str) -> None:
+    """Note down why a read was refused, for the callers that print it.
+
+    safe_read hands back None for six different reasons and an absent file is
+    one of them, so a caller that sees only None cannot tell a config that is
+    not there from one we would not touch. The difference is the whole message:
+    a world-writable settings.json is why every skill would read as `on`, and
+    saying nothing about it looks exactly like saying all is well.
+    """
+    if why is not None:
+        why.append(reason)
+    return None
+
+
+def safe_read(path: str, *, max_bytes: int = MAX_READ, why: list | None = None) -> bytes | None:
+    """Read a regular file we own, refusing symlinks at the final component.
+
+    O_NOFOLLOW so a swapped symlink cannot redirect us, O_NONBLOCK so a fifo
+    cannot hang the panel, and fstat on the descriptor rather than stat on the
+    name so the thing we checked is the thing we read. Pass a list as `why` to
+    be told which refusal this was; the return stays bytes-or-None either way,
+    so a caller with nothing to say about it needs no changing.
+    """
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        # Every decision below is taken on the descriptor we are about to read,
+        # never on the pathname. Re-opening a path after checking it is the TOCTOU
+        # race the marketplace reviewer rejects even when the checks themselves
+        # are correct.
+        if not stat.S_ISREG(st.st_mode):
+            return _refused(why, "not a regular file")
+        # A regular file with more than one link is reachable under a name we did
+        # not vet. Refuse rather than read something a hard link redirected.
+        if st.st_nlink != 1:
+            return _refused(why, "more than one hard link")
+        # Root-owned files are the packaged system skills (Omarchy ships its own
+        # under /usr/share). Refusing them would silently drop every distro skill.
+        # What we refuse is a file owned by some other unprivileged user.
+        if st.st_uid not in (os.getuid(), 0):
+            return _refused(why, "owned by another user")
+        # World-writable means anyone on the machine chooses what we parse.
+        if st.st_mode & stat.S_IWOTH:
+            return _refused(why, "world-writable")
+        if st.st_size > max_bytes:
+            limit = (f"{max_bytes // (1024 * 1024)} MiB" if max_bytes >= 1024 * 1024
+                     else f"{max_bytes} bytes")
+            return _refused(why, f"larger than {limit}")
+        os.set_blocking(fd, True)
+        # Read to st_size rather than trusting one os.read(). A short read would
+        # otherwise hand back a prefix that parses as a whole, valid document.
+        chunks = []
+        remaining = st.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ELOOP, errno.EACCES, errno.ENOTDIR, errno.EAGAIN):
+            warn(f"read {path}: {exc}")
+        # ENOENT and ENOTDIR are silent on purpose. Most machines have no
+        # ~/.codex/config.toml and no ~/.config/opencode/opencode.json, and a
+        # finding for a file nobody ever claimed exists would fire for nearly
+        # every user. Being refused a path that does exist is a different fact.
+        # Worth spelling out rather than saying "a symlink": the common way to
+        # reach this is a dotfiles manager, where the user made the link on
+        # purpose and needs to be told that what it points at went unread --
+        # not merely that something was refused.
+        if exc.errno == errno.ELOOP:
+            return _refused(why, "reached through a symlink, which is not followed")
+        if exc.errno == errno.EACCES:
+            return _refused(why, "permission denied")
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def read_text(path: str, *, max_bytes: int = MAX_READ, why: list | None = None) -> str | None:
+    raw = safe_read(path, max_bytes=max_bytes, why=why)
+    if raw is None:
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+# A comment in a JSON config is not everywhere a mistake. OpenCode documents
+# `~/.config/opencode/opencode.jsonc` beside the plain `.json` and reads either
+# with the same parser, so a comment there is something the agent itself
+# accepted -- and calling it `invalid json` would report a fault about a file
+# OpenCode loaded without complaint, which is the one kind of wrong this panel
+# must not be: a claim the reader cannot go and check.
+#
+# Only the formats that document comments get this. Claude Code's settings.json
+# stays strict, because nothing here has measured Claude accepting a comment in
+# it; guessing that it does would invent a state no agent reports.
+def strip_jsonc(text: str) -> str:
+    """Blank out // and /* */ comments and any trailing comma, string-aware.
+
+    Knowing where a string is, is the whole difficulty. The first line of nearly
+    every OpenCode config is `"$schema": "https://opencode.ai/config.json"`, and
+    a stripper that does not know it is inside a string eats from the `//`
+    onwards and turns a valid document into a truncated one.
+
+    Every byte removed is replaced by a space, and every newline inside a block
+    comment is kept, so the text handed to the parser is the same length and
+    shape as the file. A finding that names line 14 then means line 14 of the
+    file somebody is about to open, rather than line 14 of a string only this
+    program ever saw.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if ch == "\\" and i + 1 < n:
+                out.append(ch)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            out.append(ch)
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            out.append(" " * (end - i))
+            i = end
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            # An unterminated block comment runs to the end of the file, which is
+            # what the permissive parsers do. Strict JSON has already refused this
+            # text by the time we are here, so there is no better reading to keep.
+            close = text.find("*/", i + 2)
+            end = n if close < 0 else close + 2
+            out.append("".join("\n" if text[k] == "\n" else " " for k in range(i, end)))
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+    return _drop_trailing_commas("".join(out))
+
+
+def _drop_trailing_commas(text: str) -> str:
+    """The other half of JSONC: a comma before the closing brace or bracket.
+
+    Blanked in place rather than deleted, for the same reason the comments are:
+    the parser's line and column have to keep pointing into the real file.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    in_string = False
+    comma = -1
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            comma = -1
+        elif ch == ",":
+            comma = i
+        elif ch in "}]":
+            if comma >= 0:
+                out[comma] = " "
+            comma = -1
+        elif not ch.isspace():
+            comma = -1
+        i += 1
+    return "".join(out)
+
+
+def _parse_json(txt: str) -> tuple[dict | list | None, str | None]:
+    try:
+        return json.loads(txt), None
+    except json.JSONDecodeError as exc:
+        return None, f"invalid json at line {exc.lineno}"
+    except RecursionError:
+        # Deeply nested JSON blows the C parser's stack. The docstring promises a
+        # finding; without this it was an exit-1 traceback and an empty stdout.
+        return None, "json nested too deeply"
+    except (ValueError, MemoryError) as exc:
+        return None, f"unreadable json: {type(exc).__name__}"
+
+
+def parse_jsonc_text(txt: str) -> tuple[dict | list | None, str | None]:
+    """Strict JSON first; the comment stripper only where strict already failed.
+
+    Strict's answer is the one that stands, so a plain JSON file is never put
+    through the stripper at all and cannot be changed by it.
+
+    Where both fail it is the STRIPPED message that is reported, which is the
+    opposite of what it looks like it should be. Strict fails on the first `//`
+    it meets, and in a file whose format documents comments that line is not the
+    fault -- sending somebody to line 1 to look at a comment they wrote on
+    purpose is worse than saying nothing. The stripper blanks bytes in place and
+    keeps every newline, so a line counted in stripped text is the same line in
+    the file, and it is the one with the real fault on it.
+    """
+    value, err = _parse_json(txt)
+    if err is None:
+        return value, None
+    stripped, second = _parse_json(strip_jsonc(txt))
+    return (stripped, None) if second is None else (None, second)
+
+
+def read_json(path: str, *, jsonc: bool = False) -> tuple[dict | list | None, str | None]:
+    """Returns (value, error). A malformed config is a finding, not a crash."""
+    why: list[str] = []
+    txt = read_text(path, why=why)
+    if txt is None:
+        return None, (f"refused, {why[0]}" if why else None)
+    if not txt.strip():
+        return None, "empty"
+    return parse_jsonc_text(txt) if jsonc else _parse_json(txt)
+
+
+def read_toml(path: str) -> tuple[dict | None, str | None]:
+    why: list[str] = []
+    raw = safe_read(path, why=why)
+    if raw is None:
+        return None, (f"refused, {why[0]}" if why else None)
+    try:
+        import tomllib
+        return tomllib.loads(raw.decode("utf-8", "replace")), None
+    except Exception as exc:  # noqa: BLE001 - any parse failure is one finding
+        return None, f"invalid toml: {exc}"
+
+
+# A URL query string, a --header argument or an --api-key flag in an MCP command
+# line is a credential. The panel draws `target`, so anything secret-shaped is
+# replaced here, in the only process that ever sees the original.
+#
+# What each rule eats is the rest of its argument rather than the rest of the
+# word. On the joined command line there is nothing to tell one apart from the
+# other, and a header is routinely written `--header X-Api-Key: one two`, so a
+# match that stopped at whitespace left two thirds of the key on screen.
+_SECRET_WORD = r"(?:header|token|api[-_]?key|password|secret|auth[a-z-]*)"
+SECRET_FLAG = re.compile(r"(?i)(--?%ss?[= ]).*$" % _SECRET_WORD)
+SECRET_ENVISH = re.compile(r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*=).*$")
+# The same secret carried in the VALUE rather than under a flag that names it.
+# `-H` is the short form every HTTP-shaped launcher takes and its own name says
+# nothing, so what is matched here is the HEADER NAME -- `Authorization:`,
+# `X-Api-Key:`, `Proxy-Authorization:` -- which is the half of that argument
+# that is not the credential. Anchored on the name rather than on the start of
+# the argument, so the `-H=Authorization: ...` spelling falls to the same rule
+# and a path like ~/.local/share/authors/srv.js does not.
+SECRET_HEADER = re.compile(r"(?i)(^|[\s=])((?:[a-z0-9]+-)*%s)(\s*:\s*).*$" % _SECRET_WORD)
+# The same flag written as its own argument, with the value in the next one.
+# `-H` is matched case-sensitively and on its own: the pattern carries `(?i)`
+# for the words, and under that `-h` is help on nearly every launcher and
+# `--host` on several, so folding it in would blank a hostname the panel exists
+# to show.
+SECRET_FLAG_ALONE = re.compile(r"(?i)^(?:--?%ss?|(?-i:-H))$" % _SECRET_WORD)
+# A scheme and an authority, anywhere in an argument: `npx mcp-remote <url>` is
+# how most hosted servers are launched, so the URL is rarely the whole of it.
+URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*")
+
+
+def redact(text) -> str:
+    """One target string -- a URL, or one argument of a command line."""
+    out = clip(text, 512)
+    try:
+        out = URL_IN_TEXT.sub(lambda m: redact_url(m.group(0)), out)
+        out = SECRET_FLAG.sub("\\1\u2026", out)
+        out = SECRET_ENVISH.sub("\\1\u2026", out)
+        out = SECRET_HEADER.sub("\\1\\2\\3\u2026", out)
+    except Exception:
+        # A target we could not clean is a target we do not print. No display
+        # string is worth failing a scan for, and the ellipsis is honest.
+        return "\u2026"
+    return out
+
+
+def redact_argv(argv) -> str:
+    """The same, for a command line that has not been joined yet.
+
+    Joining first is what loses the boundary between arguments, and both shapes
+    a secret takes need it: a value holding a space is one argument, and
+    `--api-key` and its value are two the moment either of them holds one. The
+    argv list is intact at every call site, so it is redacted before the join
+    rather than after.
+    """
+    out = []
+    value_is_next = False
+    for element in argv:
+        element = clip(element, 512)
+        if value_is_next:
+            out.append("\u2026")
+            value_is_next = False
+            continue
+        value_is_next = bool(SECRET_FLAG_ALONE.match(element))
+        out.append(redact(element))
+    return clip(" ".join(out).strip(), 512)
+
+
+def redact_url(url: str) -> str:
+    """Blank the parts of a URL that carry a key rather than a route.
+
+    Userinfo is a credential outright. The query string goes whole, as it always
+    did. The third shape is a token sitting in the path -- `/mcp/<forty opaque
+    characters>` -- which several hosted endpoints use in place of a header and
+    which reads as an ordinary path segment until you look at its length.
+    """
+    try:
+        # Imported here rather than at the top: it drags in `ipaddress` and costs
+        # a third of the scan's whole budget, and most machines have no MCP
+        # target with a scheme in it at all.
+        import urllib.parse
+        parts = urllib.parse.urlsplit(url)
+    except Exception:  # noqa: BLE001 - an unparseable target is simply not shown
+        return "\u2026"
+    if not parts.scheme or not parts.netloc:
+        return url
+    host = parts.netloc.rsplit("@", 1)[-1]
+    if "@" in parts.netloc:
+        host = "\u2026@" + host
+    path = "/".join("\u2026" if _opaque_segment(s) else s for s in parts.path.split("/"))
+    tail = "?\u2026" if parts.query else ""
+    if parts.fragment:
+        tail += "#\u2026"
+    return f"{parts.scheme}://{host}{path}{tail}"
+
+
+def _opaque_segment(segment: str) -> bool:
+    """A path segment long enough to be a key and shaped like nothing else.
+
+    A route is words: `messages`, `streamable-http`, `v1`. A key is one long run
+    with digits in it, or a run longer than any word. Judging by length alone
+    would redact the longer route names, and judging by shape alone would keep a
+    thirty-character base64 blob, so it takes both.
+    """
+    if len(segment) <= 20:
+        return False
+    return not all(word.isalpha() and len(word) <= 16
+                   for word in re.split(r"[-_.]", segment) if word)
+
+
+def as_dict(value) -> dict:
+    """A config file is user-editable, so every value is the wrong type sooner
+    or later. `(x or {})` still hands back a str for {"mcp": "nope"} and the next
+    .items() raises; this refuses anything that is not a mapping."""
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def clip(text, limit: int = 512) -> str:
+    """Cap every third-party string before it crosses into the shell process."""
+    out = "" if text is None else str(text)
+    out = "".join(ch for ch in out if ch == "\t" or ch >= " ")
+    return out if len(out) <= limit else out[:limit - 1] + "\u2026"
+
+
+def warn(msg: str) -> None:
+    print(f"agent-skills: {msg}", file=sys.stderr)
+
+
+def tilde(path: str) -> str:
+    return "~" + path[len(HOME):] if path.startswith(HOME + "/") else path
+
+
+# ------------------------------------------------------------- frontmatter
+
+def parse_frontmatter(text: str) -> dict:
+    """YAML frontmatter, with a hand-rolled fallback.
+
+    PyYAML is used when present but is NOT assumed: it is not in the Omarchy base
+    package set. The fallback handles what actually appears in skill files —
+    plain scalars, quoted scalars, block scalars (| and >), and one level of
+    nested mapping, which is how `metadata:` is written in the wild.
+
+    A line-oriented `^description:` regex is specifically not enough. Three of
+    this machine's own skills (omarchy, diagnose-crash, security-fortress) write
+    their description as a multi-line scalar, and a regex reports their token
+    cost as 2 to 5 instead of 150, 122 and 123.
+
+    PyYAML is deliberately NOT used even where it is installed. It is absent from
+    the Omarchy base package set, so half the users would take a different code
+    path from the other half and see different token counts for the same skill —
+    and a displayed cost that depends on an optional dependency is worse than a
+    slightly simpler parser. It would also lose files outright: this machine's
+    n8n-sdk-server writes `Triggers on:` inside an unquoted scalar, which is
+    invalid YAML, and PyYAML drops the whole frontmatter rather than the one
+    field, reporting a 162-token skill as costing 4.
+    """
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    block = text[text.find("\n") + 1:end]
+    if len(block) > FRONTMATTER_LIMIT:
+        return {}
+    return parse_frontmatter_block(block)
+
+
+# A block scalar's whole header: the style, and the two indicators YAML lets an
+# author write after it in either order. Knowing only the chomping half read
+# `description: >2` as the literal text ">2 …", which put the indicator into the
+# description every agent loads and, once that string had been recorded as the
+# author's own, left reset writing it back into the file for good.
+#
+# The chomping indicator is matched and then deliberately not acted on. All it
+# decides is how many newlines survive at the end of the value, and a description
+# is one line by the time anyone reads it here: the block is stripped and its
+# newlines collapse to spaces. The indentation indicator is the half that changes
+# the text itself, so that is the half that is honoured.
+BLOCK_SCALAR = re.compile(r"^(?P<style>[|>])"
+                          r"(?:(?P<chomp>[+-])(?P<indent>[1-9])?"
+                          r"|(?P<indent_first>[1-9])(?P<chomp_last>[+-])?)?$")
+
+
+def parse_frontmatter_block(block: str) -> dict:
+    out: dict = {}
+    lines = block.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip() or line.lstrip().startswith("#") or line[:1].isspace():
+            i += 1
+            continue
+        if ":" not in line:
+            i += 1
+            continue
+        key, _, rest = line.partition(":")
+        key = key.strip()
+        rest = rest.strip()
+        header = BLOCK_SCALAR.match(rest) if rest[:1] in ("|", ">") else None
+        if header:
+            folded = header.group("style") == ">"
+            # The indentation indicator is how many columns of each line belong
+            # to the layout rather than to the text, so it is taken off rather
+            # than guessed at. Without one the block is stripped, which is what
+            # every block scalar in the wild is written to survive.
+            dedent = int(header.group("indent") or header.group("indent_first") or 0)
+            body, i = _consume_indented(lines, i + 1, dedent)
+            out[key] = (" ".join(x.strip() for x in body) if folded else "\n".join(body)).strip()
+            continue
+        if rest == "":
+            body, j = _consume_indented(lines, i + 1)
+            if body:
+                nested = {}
+                for sub in body:
+                    if ":" in sub:
+                        k2, _, v2 = sub.partition(":")
+                        nested[k2.strip()] = _unquote(v2.strip())
+                out[key] = nested
+                i = j
+                continue
+            out[key] = ""
+            i += 1
+            continue
+        # A plain scalar may still continue onto following indented lines.
+        cont, j = _consume_indented(lines, i + 1)
+        value = rest if not cont else rest + " " + " ".join(x.strip() for x in cont)
+        out[key] = _unquote(value.strip())
+        i = j if cont else i + 1
+    return out
+
+
+def has_unquoted_colon(block: str) -> bool:
+    """True when a plain scalar carries a bare `: `, which is invalid YAML.
+
+    We read such a file anyway, but a stricter agent may drop the whole
+    frontmatter, so the row is worth marking.
+    """
+    for line in block.split("\n"):
+        if not line or line[:1].isspace() or line.lstrip().startswith("#"):
+            continue
+        _, sep, rest = line.partition(":")
+        if not sep:
+            continue
+        rest = rest.strip()
+        if not rest or rest[:1] in "\"'|>":
+            continue
+        if ": " in rest:
+            return True
+    return False
+
+
+def _consume_indented(lines: list[str], start: int, dedent: int = 0) -> tuple[list[str], int]:
+    """The lines under a key, and where the next key begins.
+
+    `dedent` is a block scalar's own indentation indicator, and only that: with
+    one, exactly that many columns come off each line and whatever is left is the
+    author's text, which is what somebody writing `>2` asked for. Without one
+    every line is stripped, which is how the indentation of a block scalar that
+    declares none has always been guessed here, and the guess is right for every
+    such file on this machine.
+    """
+    body: list[str] = []
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() and not line[:1].isspace():
+            break
+        if not line.strip():
+            body.append("")
+        elif dedent and line[:dedent].isspace():
+            body.append(line[dedent:])
+        else:
+            body.append(line.strip())
+        i += 1
+    while body and not body[-1]:
+        body.pop()
+    return body, i
+
+
+def _unquote(v: str) -> str:
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+# ------------------------------------------------------------------ taxonomy
+
+# `unsorted` is last on purpose: it is where a skill waits, not what a skill is.
+# Everything the keyword rules cannot place lands there instead of being pushed
+# into `agents`, which was the old residual and was a lie -- a skill about LaTeX
+# that matched nothing is not an agents skill, it is an unfiled one, and calling
+# it agents both hid it and made that shelf untrustworthy.
+CATEGORIES = [
+    "agents", "code", "workflow", "web", "design", "media", "data",
+    "infra", "ops", "security", "automation", "content", "business", "system",
+    "unsorted",
+]
+
+GLYPH = {
+    "agents": "◇", "code": "⌘", "workflow": "⎇", "web": "▫",
+    "design": "✧", "media": "▶", "data": "▤", "infra": "☁",
+    "ops": "◉", "security": "⛨", "automation": "⟳", "content": "✎",
+    "business": "₿", "system": "⚙", "unsorted": "·",
+}
+
+# Official marketplace category -> ours. Tier 2 of the cascade.
+OFFICIAL_MAP = {
+    "development": "code", "productivity": "workflow", "database": "data",
+    "monitoring": "ops", "security": "security", "deployment": "infra",
+    "design": "design", "automation": "automation", "learning": "content",
+    "location": "system", "testing": "code", "migration": "infra", "math": "content",
+}
+
+# Tier 5. Specific categories outrank general ones; `agents` is the residual and
+# scores last and lowest, because nearly every description in this ecosystem
+# mentions skills or models or prompts.
+RULES: list[tuple[str, int, tuple[str, ...]]] = [
+    ("system", 4, ("hyprland", "omarchy", "waybar", "window manager", "desktop", "arch linux",
+                   "systemd", "shell config", "dotfiles", "keybinding", "wayland", "coredump",
+                   "crash", "segfault", "kernel", "embedded", "firmware", "game engine", "godot")),
+    ("media", 4, ("video", "audio", "image gen", "animation", "animate", "3d", "three.js", "webgl",
+                  "shader", "render", "ffmpeg", "music", "photo", "motion graphics", "gltf")),
+    ("design", 4, ("design system", "ui design", "ux", "figma", "typography", "accessibility",
+                   "visual hierarchy", "brand", "color palette", "landing page", "wireframe")),
+    ("security", 4, ("vulnerabilit", "owasp", "penetration", "exploit", "cve", "xss", "csrf",
+                     "authentication", "authorization", "compliance", "secrets", "audit")),
+    ("ops", 4, ("monitoring", "observability", "logs", "tracing", "metrics", "incident",
+                "alerting", "uptime", "sentry", "grafana", "prometheus")),
+    ("automation", 4, ("n8n", "zapier", "make.com", "workflow automation", "scraping", "scrape",
+                       "cron", "webhook", "browser automation", "playwright", "puppeteer", "rpa")),
+    ("data", 4, ("database", "postgres", "mysql", "sqlite", "migration", "sql", "orm", "prisma",
+                 "vector store", "embedding", "warehouse", "etl", "analytics", "bigquery")),
+    ("infra", 4, ("docker", "kubernetes", "terraform", "deploy", "ci/cd", "pipeline", "aws",
+                  "gcp", "azure", "container", "helm", "nginx", "serverless", "infrastructure")),
+    ("business", 4, ("payment", "stripe", "invoice", "billing", "crm", "erp", "commerce",
+                     "legal", "contract", "finance", "accounting", "tax")),
+    ("content", 3, ("seo", "marketing", "copywriting", "blog", "newsletter", "documentation",
+                    "latex", "obsidian", "note-taking", "knowledge base", "research", "citation")),
+    ("web", 3, ("react", "next.js", "nextjs", "vue", "svelte", "tailwind", "frontend",
+                "app router", "server component", "css", "html", "browser", "mobile app")),
+    ("code", 3, ("refactor", "test-driven", "unit test", "debug", "lint", "type safety",
+                 "code review", "performance", "profiling", "lsp", "api design", "rest api")),
+    ("workflow", 3, ("git ", "pull request", "commit", "changelog", "release", "issue",
+                     "planning", "specification", "roadmap", "branch")),
+    ("agents", 2, ("skill", "mcp", "prompt", "agent", "llm", "claude", "context window",
+                   "eval", "subagent", "tool use")),
+]
+
+# Without these, `api-design` scores `design` on the literal word and lands wrong.
+NEGATIVE = {
+    "design": ("api design", "schema design", "database design", "system design",
+               "api-design", "designing or reviewing rest"),
+}
+
+TAG_RULES = {
+    "nextjs": ("next.js", "nextjs", "app router"), "react": ("react",),
+    "seo": ("seo",), "video": ("video",), "animations": ("animation", "animate", "motion"),
+    "ui": ("ui ", "user interface", "design system"), "3d": ("three.js", "webgl", "3d"),
+    "docker": ("docker", "container"), "n8n": ("n8n",), "postgres": ("postgres",),
+    "tdd": ("test-driven", "tdd"), "latex": ("latex",), "mcp": ("mcp",),
+}
+
+
+# ---------------------------------------------------------- category store
+#
+# The one file this program writes, and the only reason it writes anything.
+# Everything else about a skill belongs to whoever wrote it; which shelf you
+# keep it on belongs to you, and there is nowhere in Claude Code, OpenCode or
+# Codex to say so. So it is kept here, beside this plugin, in a file that names
+# only directories and categories:
+#
+#   {"version": 1, "custom": ["ui", "video"], "assign": {"nextjs": "ui"},
+#    "hidePlacedBy": false}
+#
+# Deleting it restores every classifier guess and loses nothing else. No agent
+# configuration is touched to make a category, and none is touched to move a
+# skill between them.
+STORE_DIR = os.path.join(HOME, ".config", "agent-skills")
+STORE_PATH = os.path.join(STORE_DIR, "categories.json")
+
+# Categories of your own get one mark rather than a guessed one. It is filled
+# where the built-in glyphs are outlines, so a shelf you made reads as yours.
+CUSTOM_GLYPH = "\u25c6"
+
+# A category name reaches a group header, a JSON file and the classifier's own
+# vocabulary, so it is checked once, here, against a shape rather than cleaned.
+CATEGORY_NAME = re.compile(r"^[a-z][a-z0-9-]{0,23}$")
+# How the shelves are drawn. count-desc/count-asc are computed live and ignore
+# the stored order for display (but preserve it, so going back to custom
+# restores the last manual layout); custom draws strictly from it. Only an
+# explicit action changes the mode -- never the shape of the array.
+ORDER_MODES = ("count-desc", "count-asc", "custom")
+DEFAULT_ORDER_MODE = "count-desc"
+# A colour reaches a QML `color` property, so it is matched rather than trusted:
+# only a six-digit hex triple, never a named colour or a function call.
+HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
+CATEGORY_LABEL = re.compile(r"^[^\x00-\x1f]{1,32}$")
+# A skill is named by its directory, and a directory name is not a word: `-h`
+# is a legal one, and argparse reads it as a request for help and exits before
+# anything is written. Passing `--` gets it to this side. What is refused here
+# is only what cannot name a directory at all -- a slash, a control character,
+# and the two names that mean a directory rather than name one. A charset
+# narrower than the filesystem's would refuse `data science` and `mój-skill`,
+# both of which are skills somebody has, and refuse them with no way out: the
+# panel offers no other route to filing a row.
+SKILL_NAME = re.compile(r"^(?!\.\.?$)[^/\x00-\x1f\x7f]{1,128}$")
+MAX_CUSTOM_CATEGORIES = 32
+MAX_ASSIGNMENTS = 2000
+
+
+def read_store(findings: list | None = None) -> dict:
+    value, err = read_json(STORE_PATH)
+    if err or not isinstance(value, dict):
+        # The one file this plugin owns is the one whose loss is least visible:
+        # falling back to an empty store puts every skill back under the
+        # classifier's guess, which looks exactly like a machine nobody has
+        # filed anything on. Say so where there is anywhere to say it.
+        #
+        # An absent file is the one silence that means what it looks like -- no
+        # store yet -- and read_json says so by returning no error with no value.
+        # Everything else is a store we could not read: half a file, a link we
+        # will not follow, a list where an object should be. Reading those as
+        # empty is how a file somebody filled reads as a file nobody touched.
+        detail = err or (None if value is None else "not an object")
+        if detail and findings is not None:
+            findings.append({"what": "categories.json", "detail": detail})
+        return {"custom": [], "assign": {}, "labels": {}, "colors": {},
+                "order": [], "orderMode": DEFAULT_ORDER_MODE,
+                "hidePlacedBy": False}
+    custom = [c for c in as_list(value.get("custom"))
+              if isinstance(c, str) and CATEGORY_NAME.match(c)][:MAX_CUSTOM_CATEGORIES]
+    assign = {}
+    for k, v in list(as_dict(value.get("assign")).items())[:MAX_ASSIGNMENTS]:
+        if isinstance(k, str) and isinstance(v, str) and CATEGORY_NAME.match(v):
+            assign[clip(k, 128)] = v
+    cap = MAX_CUSTOM_CATEGORIES + len(CATEGORIES)
+    labels = {}
+    for k, v in list(as_dict(value.get("labels")).items())[:cap]:
+        if isinstance(k, str) and CATEGORY_NAME.match(k) and isinstance(v, str):
+            labels[k] = clip(v, 32)
+    colors = {}
+    for k, v in list(as_dict(value.get("colors")).items())[:cap]:
+        if (isinstance(k, str) and CATEGORY_NAME.match(k)
+                and isinstance(v, str) and HEX_COLOR.match(v)):
+            colors[k] = v.upper()
+    mode = value.get("orderMode")
+    if mode not in ORDER_MODES:
+        mode = DEFAULT_ORDER_MODE
+    # An explicit shelf order, kept only where it names a shelf that exists.
+    # Anything else -- a typo, a deleted custom category, a name this program
+    # did not write -- is dropped silently: the display falls back to the
+    # legacy order plus whatever of this survives, and a rescan never invents
+    # a shelf from a stale entry.
+    known = set(CATEGORIES) | set(custom)
+    order: list = []
+    seen: set = set()
+    for c in as_list(value.get("order")):
+        if isinstance(c, str) and CATEGORY_NAME.match(c) and c in known and c not in seen:
+            seen.add(c)
+            order.append(c)
+    return {"custom": custom, "assign": assign, "labels": labels, "colors": colors,
+            "order": order, "orderMode": mode,
+            # Whether the card still says how a skill came to be on its shelf.
+            # Absent means shown, so a store written before this key existed
+            # reads as a machine that has never turned the line off -- which is
+            # what it is.
+            "hidePlacedBy": value.get("hidePlacedBy") is True}
+
+
+def write_store(store: dict) -> None:
+    """Whole file, temp then rename, so a crash mid-write cannot leave a
+    half-written categories.json that the next scan refuses to parse."""
+    mode = store.get("orderMode", DEFAULT_ORDER_MODE)
+    if mode not in ORDER_MODES:
+        mode = DEFAULT_ORDER_MODE
+    order = [c for c in as_list(store.get("order"))
+             if isinstance(c, str) and CATEGORY_NAME.match(c)]
+    _write_json_store(STORE_PATH, {"version": 1,
+                                   "custom": store.get("custom", []),
+                                   "assign": store.get("assign", {}),
+                                   "labels": store.get("labels", {}),
+                                   "colors": store.get("colors", {}),
+                                   "order": order,
+                                   "orderMode": mode,
+                                   "hidePlacedBy": store.get("hidePlacedBy", False) is True})
+
+
+def _store_written(store: dict) -> bool:
+    """The one step in `category` that can fail for a reason the caller did not
+    cause: a full disk, a quota, a read-only $HOME, a store somebody linked into
+    a dotfiles checkout. `describe` has answered those in one line since it was
+    written; this verb answered them with a traceback on stderr and nothing on
+    stdout, which the panel reads as a failure it cannot name and a person reads
+    in `qs log`. Temp-then-rename means a refusal here really did write nothing,
+    so the sentence can say so. Named rather than left to strerror alone, because
+    `Permission denied` on its own does not say which file would not take it."""
+    try:
+        write_store(store)
+        return True
+    except Exception as exc:  # noqa: BLE001 - every one of these is the same answer
+        detail = clip(getattr(exc, "strerror", None) or str(exc) or type(exc).__name__, 160)
+        warn(f"{tilde(STORE_PATH)} could not be written: {detail}; nothing changed")
+        return False
+
+
+def _write_json_store(path: str, payload: dict) -> None:
+    """How both of the files this plugin owns are written: built whole, fsynced,
+    renamed over the old one. Shared rather than copied, because the second store
+    has exactly the need the first one has -- a descriptions.json left half
+    written would parse as an empty one and take every note with it.
+
+    A symlinked store is refused rather than written. The read side opens these
+    files O_NOFOLLOW, so one reached through a link is never read: read_store
+    hands back an empty store and says so in `findings`. Writing anyway is the
+    worse half of that bargain whichever way it is done -- the rename swaps the
+    link for a fresh file and orphans what the link pointed at, and following
+    the link instead would put that empty store over the real one, which for
+    descriptions.json is the only copy of every author's description reset
+    exists to put back. Keeping a store in a dotfiles checkout is the one setup
+    this program goes out of its way to recognise elsewhere, so it may not be
+    the setup this program silently eats.
+    """
+    if os.path.islink(path):
+        raise OSError(errno.ELOOP,
+                      f"{tilde(path)} is reached through a symlink, which is not followed")
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    text = json.dumps(payload, indent=1, sort_keys=True) + "\n"
+    tmp = path + ".tmp.%d" % os.getpid()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # The rename is a write of its own, in the parent rather than in the file.
+    # Unsynced, a crash can leave the old store, an empty one, or none -- which is
+    # exactly what building the file whole was meant to make impossible. Best
+    # effort: the bytes are already down, and a store that is one crash away from
+    # being stale is still better than a refusal for a change that landed.
+    _commit_directory(os.path.dirname(path) or ".")
+
+
+# ------------------------------------------------------- note store
+#
+# The second file this program owns, and everything in it is the reader's own:
+#
+#   {"notes": {"nextjs": "Mine: only the App Router rewrite, nothing else."}}
+#
+# A note is somebody's own words about a skill, in their own language, for
+# themselves. It is kept here and drawn above the description on the card, and no
+# agent ever opens this file -- so a note costs nothing on any turn, which is why
+# `tokens.alwaysOn` is computed from SKILL.md and never from here, and why
+# nothing in this program may suggest that writing one saves anybody a token.
+#
+# It is per name, because a name is what a person means by a skill and this
+# program has nothing else to file it under. Every copy of a name shows the same
+# note, which is right: the note is about the skill, not about one checkout of it.
+#
+# Nothing else lives here. An earlier version also held the author's own
+# description, kept so that a rewrite of somebody else's SKILL.md could be put
+# back; this program no longer writes anybody's SKILL.md, so there is nothing to
+# put back and nothing to keep.
+DESCRIBE_PATH = os.path.join(STORE_DIR, "descriptions.json")
+
+# One line of prose. Longer than every description on this machine and the same
+# bound the scanner already calls `long-description`, so a note that reaches it
+# has stopped being the one-line summary the card draws it as.
+MAX_NOTE = 1024
+MAX_NOTES = MAX_ASSIGNMENTS
+
+
+def read_describe_store(findings: list | None = None) -> dict:
+    value, err = read_json(DESCRIBE_PATH)
+    if err or not isinstance(value, dict):
+        # Said out loud for the same reason a lost categories.json is: a store
+        # that cannot be read looks exactly like a machine nobody has written a
+        # note on, and one of the two is worth knowing about. No file is no
+        # store; anything else is a store we could not read.
+        detail = err or (None if value is None else "not an object")
+        if detail and findings is not None:
+            findings.append({"what": "descriptions.json", "detail": detail})
+        return {"notes": {}}
+    notes = {}
+    for k, v in list(as_dict(value.get("notes")).items())[:MAX_NOTES]:
+        if isinstance(k, str) and isinstance(v, str) and SKILL_NAME.match(k) and v.strip():
+            notes[k] = clip(v, MAX_NOTE)
+    return {"notes": notes}
+
+
+def write_describe_store(store: dict) -> None:
+    """Only what this program owns. An earlier version of this file also kept an
+    `edited` block -- the author's own description, held so a rewrite of somebody
+    else's SKILL.md could be undone. Nothing rewrites a SKILL.md any more, so
+    there is nothing to undo and nothing to hold: a store still carrying that
+    block from an older install is read past and written without it, which is how
+    it goes away on the first note anybody writes."""
+    _write_json_store(DESCRIBE_PATH, {"version": 1, "notes": store.get("notes", {})})
+
+
+def known_categories(store: dict) -> list:
+    """The shelves in the order the panel draws them from the stored order.
+
+    A non-empty stored order wins: stale entries (a custom category deleted
+    since) are skipped, and any shelf missing from it (a category created
+    since) is appended at the end, so nothing is ever lost from the display.
+    An empty or absent order reads as the legacy order -- the built-ins first,
+    then the custom ones in the order they were made -- which is also what a
+    store written before the order key existed reads as.
+    """
+    legacy = list(CATEGORIES)
+    for c in store.get("custom", []):
+        if c not in legacy:
+            legacy.append(c)
+    order = [c for c in as_list(store.get("order")) if isinstance(c, str)]
+    if order:
+        known_set = set(legacy)
+        effective: list = []
+        seen: set = set()
+        for c in order:
+            if c in known_set and c not in seen:
+                seen.add(c)
+                effective.append(c)
+        if effective:
+            for c in legacy:
+                if c not in seen:
+                    seen.add(c)
+                    effective.append(c)
+            return effective
+    return legacy
+
+
+def classify(name: str, description: str, path: str, official: str | None) -> dict:
+    if official and official in OFFICIAL_MAP:
+        return {"category": OFFICIAL_MAP[official], "confidence": "high", "classifier": "marketplace"}
+
+    base = os.path.basename(path)
+    if "/skills/.system" in path or "/.system/" in path:
+        return {"category": "agents", "confidence": "medium", "classifier": "path"}
+    if base.startswith("n8n-"):
+        return {"category": "automation", "confidence": "medium", "classifier": "path"}
+
+    hay = f"{name} {description}".lower()
+    scores: dict[str, int] = {}
+    for cat, weight, needles in RULES:
+        if any(neg in hay for neg in NEGATIVE.get(cat, ())):
+            continue
+        hits = sum(1 for n in needles if n in hay)
+        if hits:
+            scores[cat] = scores.get(cat, 0) + hits * weight
+    if not scores:
+        return {"category": "unsorted", "confidence": "unclassified", "classifier": "none"}
+    # Tie-break by position in RULES, not in CATEGORIES. `agents` is the residual
+    # bucket and sits last in the rule table precisely so that it loses ties; on
+    # CATEGORIES order it sits first and would win them, which is how a skill
+    # whose description says "n8n workflow" eleven times classifies as `agents`.
+    order = {cat: i for i, (cat, _, _) in enumerate(RULES)}
+    ranked = sorted(scores.items(), key=lambda kv: (-kv[1], order.get(kv[0], 99)))
+    top, top_score = ranked[0]
+    runner = ranked[1][1] if len(ranked) > 1 else 0
+    if top_score >= 10 and (top_score - runner) >= 4:
+        conf = "high"
+    elif top_score >= 6:
+        conf = "medium"
+    else:
+        conf = "low"
+    return {"category": top, "confidence": conf, "classifier": "keywords"}
+
+
+def tags_for(name: str, description: str) -> list[str]:
+    hay = f"{name} {description}".lower()
+    return sorted(t for t, needles in TAG_RULES.items() if any(n in hay for n in needles))
+
+
+# ------------------------------------------------------------------- roots
+
+# ------------------------------------------------------ where OpenCode looks
+#
+# `~/.config/opencode` is the answer on most machines and on none of the
+# interesting ones. Four environment variables move or add to it, and they do
+# not do the same thing as each other -- measured against opencode 1.18.30 with
+# a marker skill in a scratch directory and `opencode debug skill`:
+#
+#   XDG_CONFIG_HOME=X        MOVES the config directory to X/opencode, and the
+#                            skills root moves with it. ~/.config/opencode/skills
+#                            stops being read at all: 17 skills became 0.
+#   OPENCODE_CONFIG_DIR=D    ADDS D/skills as a further root. The default one is
+#                            still read; both showed up in the same listing.
+#   OPENCODE_CONFIG=file     An ADDITIONAL config file, merged in. It does not
+#                            replace the global one -- opencode's own help says
+#                            "load an additional explicit config".
+#   OPENCODE_CONFIG_CONTENT  Inline JSON, merged last, "as a final local-scope
+#                            merge".
+#
+# Reading the hardcoded path instead was not a cosmetic error. Under
+# XDG_CONFIG_HOME the panel counted a directory OpenCode had stopped reading and
+# missed the one it had started on, so every OpenCode figure on the bar -- the
+# always-on token total this widget exists to print -- was computed from the
+# wrong disk.
+OPENCODE_CONFIG_NAMES = ("opencode.jsonc", "opencode.json")
+
+
+def opencode_config_dir() -> str:
+    """OpenCode's global config directory. A relative XDG_CONFIG_HOME is ignored,
+    which is what the spec says to do and what opencode itself does."""
+    xdg = os.environ.get("XDG_CONFIG_HOME") or ""
+    base = xdg if xdg.startswith("/") else os.path.join(HOME, ".config")
+    return os.path.join(base, "opencode")
+
+
+def _xdg_dir(variable: str, fallback: str, leaf: str = "opencode") -> str:
+    """One XDG base directory, resolved the way opencode resolves it.
+
+    The same measurement as the config directory, run against the other two:
+    XDG_CACHE_HOME moves `cache` and XDG_DATA_HOME moves `data`, so the fetched
+    skills root and the MCP token file follow them. Both were hardcoded here,
+    and both are read for figures the panel prints as facts.
+    """
+    base = os.environ.get(variable) or ""
+    return os.path.join(base if base.startswith("/") else os.path.join(HOME, fallback), leaf)
+
+
+def opencode_cache_dir() -> str:
+    return _xdg_dir("XDG_CACHE_HOME", ".cache")
+
+
+def opencode_data_dir() -> str:
+    return _xdg_dir("XDG_DATA_HOME", ".local/share")
+
+
+def opencode_extra_config_dir() -> str | None:
+    """The directory OPENCODE_CONFIG_DIR adds, where it names one we do not have."""
+    extra = os.environ.get("OPENCODE_CONFIG_DIR") or ""
+    if not extra.startswith("/"):
+        return None
+    extra = extra.rstrip("/")
+    return None if extra == opencode_config_dir().rstrip("/") else extra
+
+
+def opencode_config_path(directory: str | None = None) -> str:
+    """Which of the two global config files OpenCode actually loads.
+
+    Measured: with `opencode.jsonc` and `opencode.json` both present in one
+    directory, the `.jsonc` wins and the plain one is never read. This panel
+    prints a file beside every state it reports, so naming the shadowed one
+    would send somebody to edit a file their agent ignores.
+
+    `lexists` rather than `exists`, because a dangling symlink is still a file
+    OpenCode will try: the honest answer is to name it and let `safe_read`
+    refuse it out loud, not to skip past it as though it were absent.
+    """
+    directory = opencode_config_dir() if directory is None else directory
+    for name in OPENCODE_CONFIG_NAMES:
+        candidate = os.path.join(directory, name)
+        if os.path.lexists(candidate):
+            return candidate
+    return os.path.join(directory, OPENCODE_CONFIG_NAMES[-1])
+
+
+def _merge_config(base: dict, extra: dict) -> dict:
+    """One level deeper than `update`, because `mcp` is the key we read and two
+    sources each declaring a server must end with both rather than the last."""
+    out = dict(base)
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            merged = dict(out[key])
+            merged.update(value)
+            out[key] = merged
+        else:
+            out[key] = value
+    return out
+
+
+def read_opencode_config(findings: list | None = None) -> dict:
+    """Every source OpenCode merges into its global config, in the order it does.
+
+    Reading only the first of them was how a server declared in any of the other
+    two went missing from a panel whose whole claim is that it lists everything
+    three agents load.
+    """
+    directory = opencode_config_dir()
+    live = opencode_config_path(directory)
+    for name in OPENCODE_CONFIG_NAMES:
+        other = os.path.join(directory, name)
+        if other != live and os.path.lexists(other) and findings is not None:
+            findings.append({"what": tilde(other),
+                             "detail": f"not read: {os.path.basename(live)} beside it wins"})
+    merged: dict = {}
+    value, err = read_json(live, jsonc=True)
+    if err and findings is not None:
+        findings.append({"what": tilde(live), "detail": err})
+    merged = _merge_config(merged, as_dict(value))
+
+    explicit = os.environ.get("OPENCODE_CONFIG") or ""
+    if explicit.startswith("/"):
+        value, err = read_json(explicit, jsonc=True)
+        if err and findings is not None:
+            findings.append({"what": tilde(explicit), "detail": f"OPENCODE_CONFIG: {err}"})
+        merged = _merge_config(merged, as_dict(value))
+
+    inline = os.environ.get("OPENCODE_CONFIG_CONTENT") or ""
+    if inline.strip():
+        if len(inline) > MAX_READ:
+            if findings is not None:
+                findings.append({"what": "OPENCODE_CONFIG_CONTENT",
+                                 "detail": f"larger than {MAX_READ // (1024 * 1024)} MiB, not read"})
+        else:
+            value, err = parse_jsonc_text(inline)
+            if err and findings is not None:
+                findings.append({"what": "OPENCODE_CONFIG_CONTENT", "detail": err})
+            merged = _merge_config(merged, as_dict(value))
+    return merged
+
+
+def skill_roots() -> list[dict]:
+    """Every directory the three agents look in, and which of them look there.
+
+    OpenCode reads Claude Code's and the shared ~/.agents directories natively
+    unless OPENCODE_DISABLE_EXTERNAL_SKILLS is set; Claude Code reads neither of
+    the other two. That asymmetry is why `tools` is a list per root rather than
+    one tool per path.
+
+    The fifth root is the one nobody puts anything in by hand. OpenCode's
+    `skills.urls` fetches skills over HTTP and caches them under
+    ~/.cache/opencode/skills, and they are loaded and charged for exactly like
+    the ones on disk -- on the machine this was written for, two of them, worth
+    about 274 tokens on every OpenCode turn. Leaving a cache directory out
+    because it is a cache would understate the one figure this widget exists to
+    print.
+    """
+    oc_external = not os.environ.get("OPENCODE_DISABLE_EXTERNAL_SKILLS")
+    # Cursor is the greediest reader on the machine. Its own bundle names nine
+    # skill directories outright, four of them belonging to other agents -- read
+    # out of /opt/cursor-agent/1931.index.js, `./src/utils/skill-path-utils.ts`:
+    #
+    #   [".cursor/skills/", ".cursor/skills-cursor/", ".cursor/cloud-skills/",
+    #    ".cursor/plugins/", ".claude/skills/", ".claude/plugins/",
+    #    ".codex/skills/", ".grok/skills/", ".agents/skills/"]
+    #
+    # So installing Cursor does not add a column of its own findings: it lights up
+    # rows that are already here. Pi is the opposite and reads nobody else's --
+    # its binary has no reference to .claude/skills or .agents/skills at all.
+    oc = ["opencode"] if oc_external else []
+    claude_tools = ["claude", "cursor"] + oc
+    agents_tools = ["codex", "cursor"] + oc
+    roots = [
+        {"path": f"{HOME}/.claude/skills", "tools": claude_tools, "scope": "user"},
+        {"path": os.path.join(opencode_config_dir(), "skills"),
+         "tools": ["opencode"], "scope": "user"},
+        {"path": f"{HOME}/.codex/skills", "tools": ["codex", "cursor"], "scope": "user"},
+        {"path": f"{HOME}/.agents/skills", "tools": agents_tools, "scope": "shared"},
+        {"path": os.path.join(opencode_cache_dir(), "skills"),
+         "tools": ["opencode"], "scope": "fetched"},
+        # Pi keeps its agent under ~/.pi/agent, and the directory name is settled
+        # in the binary as `CONFIG_DIR_NAME = pkg.piConfig?.configDir || ".pi"` --
+        # a build-time value, not an environment one, so nothing relocates it.
+        {"path": f"{HOME}/.pi/agent/skills", "tools": ["pi"], "scope": "user"},
+        {"path": f"{HOME}/.cursor/skills", "tools": ["cursor"], "scope": "user"},
+        # Cursor ships its own and records them in
+        # .cursor-managed-skills-manifest.json under `builtinSkillIds`. They are on
+        # disk rather than in the binary, so unlike Claude's they can be counted --
+        # and the scope says who put them there.
+        {"path": f"{HOME}/.cursor/skills-cursor", "tools": ["cursor"], "scope": "bundled"},
+        {"path": f"{HOME}/.cursor/cloud-skills", "tools": ["cursor"], "scope": "fetched"},
+        {"path": f"{HOME}/.grok/skills", "tools": ["cursor"], "scope": "user"},
+    ]
+    # Added rather than substituted, which is the half of this that is easy to
+    # get backwards: OPENCODE_CONFIG_DIR gives OpenCode a second place to look
+    # and takes nothing away, so both roots were in the same listing when it
+    # was measured.
+    extra = opencode_extra_config_dir()
+    if extra:
+        roots.append({"path": os.path.join(extra, "skills"),
+                      "tools": ["opencode"], "scope": "user"})
+    return roots + plugin_skill_roots()
+
+
+def plugin_skill_roots() -> list[dict]:
+    """The skills a Claude Code plugin brings with it.
+
+    These were invisible. The four roots above are the ones a user drops a
+    directory into; a plugin's skills live inside its cached checkout, and until
+    now the panel listed the plugin as one row and never opened it. On a machine
+    where `impeccable` is installed as a plugin rather than copied into
+    ~/.claude/skills, that meant its twenty-three documented actions did not
+    exist as far as this program was concerned, and copying it gave you a bare
+    invocation with nothing to pick from.
+
+    The active version is not guessed. `installed_plugins.json` records an
+    `installPath` per plugin, which is the one Claude Code loaded; the cache can
+    hold several versions and picking the highest-numbered directory would
+    eventually pick the wrong one.
+
+    Only Claude Code sees these. OpenCode reads ~/.claude/skills natively but
+    not another agent's plugin cache, so `tools` is Claude alone.
+    """
+    value, err = read_json(f"{HOME}/.claude/plugins/installed_plugins.json")
+    if err or not isinstance(value, dict):
+        return []
+    out = []
+    for pid, entries in as_dict(value.get("plugins")).items():
+        if not isinstance(pid, str) or len(out) >= MAX_CUSTOM_CATEGORIES * 8:
+            continue
+        # `plugin@marketplace`; the invocation namespace is the plugin.
+        name = pid.split("@", 1)[0]
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", name):
+            continue
+        market = pid.split("@", 1)[1] if "@" in pid else ""
+        for entry in as_list(entries):
+            path = as_dict(entry).get("installPath")
+            if not isinstance(path, str) or not path.startswith("/"):
+                continue
+            # The one provenance any skill on this machine actually has. A skill
+            # directory carries no remote, but Claude Code records the commit it
+            # installed a plugin from, so the skills inside that plugin came from
+            # a commit somebody can name. Carried onto the row rather than left
+            # on the plugin, because the row is what a reader is looking at.
+            sha = as_dict(entry).get("gitCommitSha")
+            out.append({"path": os.path.join(path, "skills"),
+                        "tools": ["claude"],
+                        "scope": clip(as_dict(entry).get("scope") or "plugin", 16),
+                        "plugin": name,
+                        "marketplace": clip(market, 128),
+                        "sha": clip(sha, 64) if isinstance(sha, str) else ""})
+    return out
+
+
+# A skill that takes arguments says so in `argument-hint`, the frontmatter field
+# Claude Code shows during autocomplete. It is prose for a human, not a grammar,
+# so this reads it the way a human does and never guesses past what it can see.
+#
+#   impeccable: "[shape \u00b7 audit|critique \u00b7 animate|bolder|...|typeset] [target]"
+#   others:     "[issue-number]" \u00b7 "[filename] [format]" \u00b7 "[pr-number] [priority]"
+#
+# Each bracketed run is one positional argument. Inside it `|` and the middle dot
+# both separate alternatives -- impeccable uses the dot to group related actions
+# and the bar within a group, but every token in there is a value the same
+# argument can take, which is what a picker needs. A run with one token is a
+# placeholder the user has to fill in, and is offered as a label rather than a
+# choice. Nothing here is executed and nothing is inferred: a hint that says
+# nothing yields no arguments and the row keeps its plain invocation.
+ARG_GROUP_RE = re.compile(r"[\[<]([^\]>]{1,400})[\]>]")
+ARG_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+MAX_ARG_GROUPS = 6
+MAX_ARG_OPTIONS = 64
+
+
+def parse_argument_hint(hint) -> list:
+    if not isinstance(hint, str):
+        return []
+    text = hint.strip()
+    if not text:
+        return []
+
+    groups = ARG_GROUP_RE.findall(text)
+    if not groups:
+        # No brackets at all. A bare "add|remove|list" is still a usable choice;
+        # a bare sentence is not, and falls out below when nothing tokenises.
+        groups = [text]
+
+    out = []
+    for raw in groups[:MAX_ARG_GROUPS]:
+        tokens = []
+        for piece in re.split(r"[|\u00b7,]", raw):
+            piece = piece.strip().strip("*`\"'")
+            if ARG_TOKEN_RE.match(piece) and piece not in tokens:
+                tokens.append(piece)
+            if len(tokens) >= MAX_ARG_OPTIONS:
+                break
+        if len(tokens) > 1:
+            out.append({"kind": "choice", "options": tokens})
+        elif len(tokens) == 1:
+            out.append({"kind": "value", "label": tokens[0]})
+    # A hint made only of placeholders tells the user to type something and gives
+    # a picker nothing to pick, so it is reported but never offered as a menu.
+    return out if any(a["kind"] == "choice" for a in out) else []
+
+
+def token_estimate(name: str, description: str, when_to_use: str, divisor: int = 4) -> int:
+    joined = " ".join(x for x in (name, description, when_to_use) if x)
+    # math.floor(x + 0.5), not round(): Python rounds halves to even, JavaScript
+    # rounds them up, and the figure we are matching was produced by JavaScript.
+    # latex-engineer lands on exactly 66.5 and the difference is visible.
+    return math.floor(len(joined) / divisor + 0.5)
+
+
+# -------------------------------------------------------------------- scan
+
+# Which of the three agents has a live process. Read out of /proc rather than by
+# asking pgrep, because this helper starts nothing: it is called by a shell that
+# is one process for the whole desktop, and a fork per bar tick is not a cost the
+# bar is allowed to impose. One open and one short read per pid, and a directory
+# that is not there -- another kernel, a container without /proc -- answers "none
+# of them" rather than raising.
+#
+# comm is what the process calls itself, so a process that wants to be counted as
+# an agent can be. The consequence of believing it is which of three numbers the
+# bar prints, which is not worth a defence.
+AGENT_COMMS = ("claude", "opencode", "codex")
+
+
+def running_agents() -> dict:
+    live = {name: False for name in AGENT_COMMS}
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return live
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm", "rb") as fh:
+                comm = fh.read(64).decode("utf-8", "replace").strip()
+        except OSError:
+            # A pid that exited between the listing and the read, or one this
+            # user may not look at. Both are ordinary.
+            continue
+        if comm in live:
+            live[comm] = True
+            if all(live.values()):
+                break
+    return live
+
+
+def scan(divisor: int = 4) -> dict:
+    started = time.monotonic()
+    deadline = started + DEADLINE_SECONDS
+    findings: list[dict] = []
+    by_real: dict[str, dict] = {}
+
+    claude_settings, err = read_json(f"{HOME}/.claude/settings.json")
+    if err:
+        findings.append({"what": "claude settings.json", "detail": err})
+    overrides = as_dict(as_dict(claude_settings).get("skillOverrides"))
+
+    claude_state, err = read_json(f"{HOME}/.claude.json")
+    if err:
+        findings.append({"what": "claude.json", "detail": err})
+    usage = as_dict(as_dict(claude_state).get("skillUsage"))
+
+    catalog_cat = _catalog_categories()
+    store = read_store(findings)
+    descriptions = read_describe_store(findings)
+
+    # Held rather than re-derived: building it a second time re-reads
+    # installed_plugins.json, and this walk is the only reader of either.
+    roots = skill_roots()
+    for root in roots:
+        base = root["path"]
+        try:
+            # Closed rather than left to the collector: one descriptor per root
+            # is nothing on its own, and a helper that leaks them is a helper
+            # nobody can call in a loop later.
+            with os.scandir(base) as listing:
+                entries = sorted(listing, key=lambda e: e.name)
+        except OSError:
+            continue
+        if len(entries) > MAX_DIR_ENTRIES:
+            findings.append({"what": tilde(base),
+                             "detail": f"{len(entries)} entries, reading the first {MAX_DIR_ENTRIES}"})
+            entries = entries[:MAX_DIR_ENTRIES]
+        for entry in entries:
+            if _walk_exhausted(by_real, findings, deadline, tilde(base)):
+                break
+            if entry.name.startswith("."):
+                if entry.name != ".system":
+                    continue
+            # Deciding what an entry is, and listing a `.system` directory, both
+            # follow the name to whatever it points at, and the kernel says no
+            # far more often than it says "missing": a link pointing at itself
+            # is ELOOP, and ~/.codex/skills/.system is rewritten by Codex on
+            # every launch, so it can be caught as a dangling link, a link to a
+            # file, or a directory this user may not read. Any one of them used
+            # to end the scan with a traceback and leave the panel empty, so an
+            # entry we cannot classify is one finding and the walk goes on.
+            targets = [(entry.path, False)]
+            try:
+                if not (entry.is_dir(follow_symlinks=True) or entry.is_symlink()):
+                    continue
+                if entry.name == ".system":
+                    with os.scandir(entry.path) as listing:
+                        packaged = sorted(listing, key=lambda e: e.name)
+                    if len(packaged) > MAX_DIR_ENTRIES:
+                        findings.append({"what": tilde(entry.path),
+                                         "detail": f"{len(packaged)} entries, "
+                                                   f"reading the first {MAX_DIR_ENTRIES}"})
+                        packaged = packaged[:MAX_DIR_ENTRIES]
+                    # Each child is asked about separately. Inside one `try` a
+                    # single bad entry raises out of the whole listing, and the
+                    # `continue` below would then drop every healthy skill
+                    # beside it and blame the directory that read perfectly
+                    # well -- which is the one thing this guard exists to stop.
+                    targets = []
+                    for child in packaged:
+                        try:
+                            if child.is_dir(follow_symlinks=True):
+                                targets.append((child.path, True))
+                        except OSError as exc:
+                            findings.append({"what": tilde(child.path),
+                                             "detail": f"unreadable, {clip(exc.strerror or exc, 96).lower()}"})
+            except OSError as exc:
+                findings.append({"what": tilde(entry.path),
+                                 "detail": f"unreadable, {clip(exc.strerror or exc, 96).lower()}"})
+                continue
+            for path, bundled in targets:
+                if _walk_exhausted(by_real, findings, deadline, tilde(entry.path)):
+                    break
+                _ingest(by_real, path, base, root, overrides, usage,
+                        catalog_cat, store, descriptions, divisor, findings, bundled=bundled)
+
+    items = list(by_real.values())
+    _mark_drift(items)
+    items.sort(key=lambda r: (r["taxonomy"]["category"], r["dirName"].lower()))
+    return {
+        "version": VERSION,
+        "generatedAt": int(time.time()),
+        "elapsedMs": round((time.monotonic() - started) * 1000, 1),
+        "items": items,
+        "mcp": scan_mcp(findings),
+        "plugins": scan_claude_plugins(findings),
+        "findings": findings,
+        "counts": _counts(items),
+        # Which agents are up right now. The inventory only moves when something
+        # is installed; this moves whenever a session starts, and the bar needs
+        # both to print the figure for the agent you are actually paying for.
+        "running": running_agents(),
+        # What the panel needs to draw a group header: the order categories are
+        # listed in, whichever of them you renamed or recoloured, and which are
+        # yours rather than built in.
+        "categories": {
+            "order": known_categories(store),
+            "orderMode": store["orderMode"],
+            "custom": store["custom"],
+            "labels": store["labels"],
+            "colors": store["colors"],
+            # Not a category, but the one preference this plugin keeps, and it is
+            # about the categories: whether a card still explains how the skill
+            # came to be on its shelf. It travels here because this is already
+            # the block the panel reads to draw anything shelf-shaped, and a
+            # second block holding one boolean would be a second thing to keep
+            # in step with the store.
+            "hidePlacedBy": store["hidePlacedBy"],
+        },
+    }
+
+
+def _walk_exhausted(by_real: dict, findings: list, deadline: float, where: str) -> bool:
+    """The deadline and the item cap, asked once per directory we are about to
+    open. A `.system` directory used to be walked outside both, which left the
+    one place a packaged skill set writes into as the only unbounded part of the
+    walk. Reported once per place: the same limit reached again is the same
+    fact, and a findings list is read by a person.
+    """
+    if time.monotonic() > deadline:
+        finding = {"what": where, "detail": "scan deadline reached, listing is partial"}
+    elif len(by_real) >= MAX_ITEMS:
+        finding = {"what": "inventory", "detail": f"capped at {MAX_ITEMS} items"}
+    else:
+        return False
+    if finding not in findings:
+        findings.append(finding)
+    return True
+
+
+def _origin_of(root: dict) -> dict:
+    """Where this skill came from, on the rare row that can answer.
+
+    A skill directory is not a checkout: no remote, no recorded commit, usually
+    no version. The one exception is a skill shipped inside a Claude Code
+    plugin, because `installed_plugins.json` records the commit that plugin was
+    installed from. Everything else reports `none`, which is the truth and is
+    what stops the panel from implying it checked.
+    """
+    sha = root.get("sha") or ""
+    if not root.get("plugin") or not sha:
+        return {"type": "none", "url": None, "confidence": "unknown"}
+    market = root.get("marketplace") or ""
+    return {"type": "plugin", "url": None, "confidence": "recorded",
+            "plugin": root.get("plugin"), "marketplace": market,
+            "installedSha": sha}
+
+
+def _ingest(by_real, dir_path, base, root, overrides, usage, catalog_cat, store,
+            descriptions, divisor, findings, bundled=False):
+    skill_md = os.path.join(dir_path, "SKILL.md")
+    real = os.path.realpath(dir_path)
+    mount_path = tilde(dir_path)
+    is_link = os.path.islink(dir_path)
+
+    existing = by_real.get(real)
+    if existing is not None:
+        for tool in root["tools"]:
+            if not any(m["tool"] == tool and m["path"] == mount_path for m in existing["mounts"]):
+                # `abs` on every mount, not only on the first root that reached the
+                # skill. It is the only field that can name a path to act on, and a
+                # display string with `~` in it re-expanded on the far side is how
+                # something gets deleted that nobody pointed at.
+                existing["mounts"].append(
+                    {"tool": tool, "path": mount_path, "abs": dir_path,
+                     "link": "symlink" if is_link else "real"})
+            # One file reachable from several roots is one skill in several tools.
+            # diagnose-crash is a single SKILL.md that all three agents load, and
+            # a `tools` list left at whichever root was scanned first would hide
+            # two of them.
+            if tool not in existing["tools"]:
+                existing["tools"].append(tool)
+                existing["state"].update(
+                    _skill_state(existing["dirName"], existing["displayName"], [tool],
+                                 overrides, existing["flags"]["builtin"]))
+        return
+
+    why: list[str] = []
+    text = read_text(skill_md, why=why)
+    if text is None:
+        if why:
+            findings.append({"what": tilde(skill_md), "detail": f"refused, {why[0]}"})
+        elif not os.path.exists(skill_md):
+            findings.append({"what": tilde(dir_path),
+                             "detail": "broken symlink" if is_link and not os.path.exists(real)
+                             else "directory without SKILL.md"})
+        return
+
+    fm = parse_frontmatter(text)
+    dir_name = os.path.basename(dir_path)
+    display = str(fm.get("name") or dir_name)
+    # Top level or under `metadata`, because one product writes it both ways.
+    # Impeccable 4.1.1 puts `version:` at the top of every build; by 4.2.2 the
+    # build for ~/.agents had moved it to `metadata.version` while the others
+    # kept it where it was. Reading only the top level would see one copy
+    # declaring a version and the other declaring none, which is the shape that
+    # means "one of these is behind" -- and the two would be flagged as drift
+    # again for no reason but where a key sits.
+    _meta_fm = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
+    declared = clip(str(fm.get("version") or _meta_fm.get("version") or ""), 32)
+    description = str(fm.get("description") or "").replace("\n", " ").strip()
+    when_to_use = str(fm.get("when_to_use") or "").replace("\n", " ").strip()
+
+    attention: list[str] = []
+    if display != dir_name:
+        attention.append("name-mismatch")
+    if not description:
+        attention.append("no-description")
+    if len(description) > 1024:
+        attention.append("long-description")
+    fm_end = text.find("\n---", 3)
+    if fm_end != -1 and has_unquoted_colon(text[text.find("\n") + 1:fm_end]):
+        attention.append("invalid-yaml")
+
+    meta = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
+    tax = classify(display, description, dir_path, catalog_cat.get(dir_name))
+    if meta.get("agent-skills.category") in CATEGORIES:
+        tax = {"category": meta["agent-skills.category"], "confidence": "authored",
+               "classifier": "frontmatter"}
+    # Above the author's own frontmatter, because it is the reader's shelf. The
+    # frontmatter says what the skill is; this says where you keep it, and the
+    # two are allowed to disagree.
+    shelved = store["assign"].get(dir_name) or store["assign"].get(display)
+    if shelved:
+        tax = {"category": shelved, "confidence": "authored", "classifier": "you"}
+    # A guess is not a fault. These two used to be reported as things needing
+    # attention, which put a warning on any skill whose description happened not
+    # to contain the words a rule looks for -- sixteen of them on a machine like
+    # this one -- and buried `drift`, which means two agents are running
+    # different code. The confidence is still in `taxonomy` for anyone who wants
+    # it; what an unplaced skill gets now is the `unsorted` shelf and a control
+    # to move it off, not a red dot.
+
+    # What the agent reads is what is in SKILL.md, so `fileText` is that text and
+    # the token estimate below is taken from it -- never from the note, which the
+    # agent cannot see and which therefore appears in no figure anywhere. The
+    # note is an annotation drawn above the description; the description is the
+    # text that is charged for, and it is charged for at whatever it says now.
+    note = descriptions["notes"].get(dir_name)
+    file_text = clip(description, 1024)
+
+    u = usage.get(dir_name) or usage.get(display) or {}
+    last = u.get("lastUsedAt")
+    record = {
+        "key": f"skill:{real}",
+        "realPath": real,
+        "contentHash": "sha256:" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16],
+        "kind": "skill",
+        "displayName": clip(display, 128),
+        "dirName": clip(dir_name, 128),
+        "declaredVersion": declared or None,
+        # The same string `describe.fileText` carries, and clipped once for both:
+        # what the panel prints and what the agent reads are the same text, and
+        # bounding it twice costs a pass over every description on the machine.
+        "description": file_text,
+        "scope": "bundled" if bundled else root["scope"],
+        "linkage": "symlink" if is_link else "real",
+        "mounts": [{"tool": t, "path": mount_path, "abs": dir_path,
+                    "link": "symlink" if is_link else "real"}
+                   for t in root["tools"]],
+        "tools": list(root["tools"]),
+        "state": _skill_state(dir_name, display, root["tools"], overrides, bundled),
+        # A plugin's skill is addressed through its plugin: Claude Code calls it
+        # `/impeccable:impeccable`, not `/impeccable`. Getting this wrong hands
+        # the user a command their agent does not have.
+        # Five agents, five spellings, and only Claude Code keys by the directory.
+        # Pi's is the odd one: `/skill:` then the declared name, taken from its own
+        # binary, where the string is built as skill:${skill.name}. Cursor takes a
+        # bare `/${e.name}`. Copying the wrong one is silent -- the agent simply has
+        # no such command -- which is why each is written from the identity that
+        # agent actually reads rather than from one shared id.
+        "invocation": ({"claude": f"/{root['plugin']}:{dir_name}"} if root.get("plugin")
+                       else {"claude": f"/{dir_name}",
+                             "opencode": f"/{display}", "codex": f"${display}",
+                             "pi": f"/skill:{display}", "cursor": f"/{display}"}),
+        "argumentHint": clip(str(fm.get("argument-hint") or ""), 400) or None,
+        "argumentChoices": parse_argument_hint(fm.get("argument-hint")),
+        # `chars` is the length the estimate was taken from, published because the
+        # panel cannot reconstruct it: `whenToUse` never reaches the scan output
+        # and `alwaysOn` has already been rounded. Without it the editor's "once
+        # saved" figure rounds a rounded number and disagrees with the next scan
+        # on about one row in five -- two claims about the single figure this
+        # widget exists to print.
+        "tokens": {"alwaysOn": token_estimate(dir_name, description, when_to_use, divisor),
+                   "chars": len(" ".join(x for x in (dir_name, description, when_to_use) if x)),
+                   "method": f"chars/{divisor}"},
+        "describe": {
+            # The reader's own words about this skill, drawn above the
+            # description on the card. No agent reads it and no figure counts it,
+            # and it is the only thing under this key: the description below is
+            # reported as it stands and is never written from here.
+            "noteText": note,
+        },
+        "usage": {"count": u.get("usageCount", 0), "lastUsedAt": last,
+                  "daysSinceUse": (int((time.time() * 1000 - last) / 86400000) if last else None),
+                  "source": "claude.json" if u else "not tracked"},
+        "taxonomy": {**tax, "tags": tags_for(display, description),
+                     "glyph": GLYPH.get(tax["category"], CUSTOM_GLYPH)},
+        "origin": _origin_of(root),
+        "update": {"state": "unknown"},
+        "attention": attention,
+        "flags": {"builtin": bundled, "readOnly": bundled,
+                  "pluginProvided": bool(root.get("plugin"))},
+    }
+    by_real[real] = record
+
+
+def _mark_drift(items: list[dict]) -> None:
+    """Tell two copies of one name apart, and only alarm about the bad case.
+
+    Deduplicating on realpath alone reports two copies as unrelated; on name
+    alone, as identical. Both are wrong, and "same name, different content, both
+    loaded" is a real state on this machine: ~/.claude/skills/omarchy is a copy
+    that has drifted from the /usr/share original the other tools read.
+
+    But differing content is not on its own a fault, and treating it as one made
+    the panel cry wolf about the most careful thing in the inventory. Impeccable
+    ships one release compiled per harness on purpose -- its own site says so,
+    and the Codex build carries anti-pattern rules aimed at Codex's habits that
+    the Claude build does not want. Two of those builds sat side by side, both
+    declaring 4.1.1, thirty-four files apart, and got the same red flag as a
+    genuinely stale copy. Merging them, which is what the flag invites, would
+    have thrown away the tuning that is the point of shipping them separately.
+
+    So the version decides. Same declared version means one release built two
+    ways: recorded as `variantPeers`, no attention code, nothing red. A different
+    version means one copy is behind, which is `drift` and always was. A version
+    missing on either side leaves nothing to compare, so content stands in for it
+    and the old behaviour holds -- most hand-written skills declare no version,
+    and for those a content difference really is the only signal there is.
+
+    The reader can now be the cause of one. Writing a description writes a single
+    copy of a name, so where two copies declare no version the difference that
+    appears afterwards is a real one: two files, two texts, both loaded, and the
+    agent reading whichever it reaches first. The flag is right to say so, and it
+    says only what it ever said -- that the copies differ, not that anybody erred.
+    """
+    by_name: dict[str, list[dict]] = {}
+    for it in items:
+        by_name.setdefault(it["dirName"], []).append(it)
+    for group in by_name.values():
+        if len(group) < 2:
+            continue
+        if len({it["contentHash"] for it in group}) == 1:
+            continue
+        versions = {it.get("declaredVersion") for it in group}
+        same_release = len(versions) == 1 and None not in versions
+        for it in group:
+            peers = [p["realPath"] for p in group if p is not it]
+            if same_release:
+                it["variantPeers"] = peers
+                continue
+            if "drift" not in it["attention"]:
+                it["attention"].append("drift")
+            it["driftPeers"] = peers
+
+
+def _claude_override(overrides, dir_name, declared_name):
+    """Which `skillOverrides` key Claude Code will actually read for this skill.
+
+    Its own lookup is `overrides[name] ?? overrides[unqualifiedName]`, so a skill
+    answers to two keys and either one can be the one somebody wrote. Nearly always
+    they are the same string; `taste-skill` is the case where they are not, because
+    its SKILL.md declares `name: design-taste-frontend`. Reading only the directory
+    would miss an override written under the declared name, and reading only the
+    declared name would miss the far more common one. Declared first, to match the
+    order above, and the directory as the fallback it is there to be.
+    """
+    for key in (declared_name, dir_name):
+        if key and key in overrides:
+            return overrides[key]
+    return "on"
+
+
+def _skill_state(dir_name, declared_name, tools, overrides, bundled):
+    state = {}
+    if "claude" in tools:
+        state["claude"] = {
+            "value": _claude_override(overrides, dir_name, declared_name),
+            "ladder": ["on", "name-only", "user-invocable-only", "off"],
+            "writable": not bundled,
+            "file": tilde(f"{HOME}/.claude/settings.json"),
+        }
+    if "opencode" in tools:
+        # Not writable, and the honest reason is that nobody has found the switch.
+        # Claude has `skillOverrides` and Codex has a `[[skills.config]]` block, both
+        # of them a documented key in a file the user owns. The nearest thing OpenCode
+        # has is `disabled_skills` in a config belonging to oh-my-openagent, which is
+        # a plugin and not OpenCode -- so claiming this is writable would promise a
+        # switch that only exists on machines running somebody else's add-on.
+        state["opencode"] = {"value": "allow", "writable": False,
+                             "file": tilde(opencode_config_path())}
+    if "codex" in tools:
+        state["codex"] = {"value": "enabled", "writable": not bundled, "needsRestart": True,
+                          "file": tilde(f"{HOME}/.codex/config.toml")}
+    if "pi" in tools:
+        # Pi keeps a `skills` array in its own settings file. Read-only here for the
+        # same reason every other switch is: this version reports state and changes
+        # none of it.
+        state["pi"] = {"value": "enabled", "writable": False,
+                       "file": tilde(f"{HOME}/.pi/agent/settings.json")}
+    if "cursor" in tools:
+        # Cursor has nowhere to write this. It ships no per-skill enable key, which
+        # is why the one manager that does write configs refuses the operation
+        # outright rather than inventing a file -- so the honest row says the state
+        # and names no file at all.
+        state["cursor"] = {"value": "enabled", "writable": False, "file": None}
+    return state
+
+
+def _catalog_categories() -> dict:
+    data, _ = read_json(f"{HOME}/.claude/plugins/plugin-catalog-cache.json")
+    out: dict[str, str] = {}
+    if not isinstance(data, dict):
+        return out
+    for entry in as_dict(as_dict(data.get("catalog")).get("plugins")).values():
+        me = as_dict(as_dict(entry).get("marketplace_entry"))
+        if me.get("name") and me.get("category"):
+            out[me["name"]] = me["category"]
+    return out
+
+
+# --------------------------------------------------------------------- MCP
+
+def scan_mcp(findings: list[dict]) -> list[dict]:
+    servers: list[dict] = []
+
+    oc = read_opencode_config(findings)
+    for name, cfg in as_dict(as_dict(oc).get("mcp")).items():
+        cfg = as_dict(cfg)
+        servers.append({
+            "kind": "mcp", "tool": "opencode", "name": clip(name, 128),
+            "transport": clip(cfg.get("type", "local"), 32),
+            "target": (redact(cfg["url"]) if cfg.get("url")
+                       else redact_argv(as_list(cfg.get("command")))),
+            "enabled": cfg.get("enabled", True) is not False, "scope": "user",
+            "auth": _opencode_auth(name), "writable": False,
+        })
+
+    cx, err = read_toml(f"{HOME}/.codex/config.toml")
+    if err:
+        findings.append({"what": "codex config.toml", "detail": err})
+    for name, cfg in as_dict(as_dict(cx).get("mcp_servers")).items():
+        cfg = as_dict(cfg)
+        argv = [str(cfg.get("command", ""))] + [str(a) for a in as_list(cfg.get("args"))]
+        servers.append({
+            "kind": "mcp", "tool": "codex", "name": clip(name, 128), "transport": "stdio",
+            "target": redact_argv(argv),
+            "enabled": cfg.get("enabled", True) is not False, "scope": "user",
+            "auth": "unknown", "writable": False,
+        })
+
+    state, _ = read_json(f"{HOME}/.claude.json")
+    for name, cfg in as_dict(as_dict(state).get("mcpServers")).items():
+        cfg = as_dict(cfg)
+        argv = [str(cfg.get("command", ""))] + [str(a) for a in as_list(cfg.get("args"))]
+        servers.append({
+            "kind": "mcp", "tool": "claude", "name": clip(name, 128),
+            "transport": clip(cfg.get("type", "stdio"), 32),
+            "target": redact(cfg["url"]) if cfg.get("url") else redact_argv(argv),
+            "enabled": True, "scope": "user", "auth": "unknown", "writable": False,
+        })
+
+    # claude.ai connectors are not on disk. Live state needs the API; the names
+    # survive offline in claudeAiMcpEverConnected, which is why this degrades to
+    # a greyed list rather than an empty one.
+    for name in as_list(as_dict(state).get("claudeAiMcpEverConnected")):
+        servers.append({
+            "kind": "mcp", "tool": "claude", "name": clip(name, 128), "transport": "http",
+            "target": "", "enabled": None, "scope": "account",
+            "auth": "unknown", "writable": False, "source": "claudeAiMcpEverConnected",
+        })
+    return servers
+
+
+def _opencode_auth(name: str) -> str:
+    data, _ = read_json(os.path.join(opencode_data_dir(), "mcp-auth.json"))
+    entry = as_dict(as_dict(data).get(name))
+    if not entry:
+        return "unknown"
+    expires = as_dict(entry.get("tokens")).get("expiresAt") or 0
+    return "connected" if expires > time.time() else "expired"
+
+
+def scan_claude_plugins(findings: list[dict]) -> list[dict]:
+    installed, err = read_json(f"{HOME}/.claude/plugins/installed_plugins.json")
+    if err:
+        findings.append({"what": "installed_plugins.json", "detail": err})
+    settings, _ = read_json(f"{HOME}/.claude/settings.json")
+    enabled = as_dict(as_dict(settings).get("enabledPlugins"))
+    out = []
+    for pid, records in as_dict(as_dict(installed).get("plugins")).items():
+        for rec in as_list(records):
+            rec = as_dict(rec)
+            out.append({
+                "kind": "plugin", "tool": "claude", "name": clip(pid, 128),
+                "version": rec.get("version"), "scope": rec.get("scope", "user"),
+                "enabled": enabled.get(pid, True), "installPath": rec.get("installPath"),
+                "origin": {"type": "marketplace", "installedSha": rec.get("gitCommitSha")},
+                "writable": True,
+            })
+    return out
+
+
+def _counts(items: list[dict]) -> dict:
+    per_tool: dict[str, int] = {}
+    per_cat: dict[str, int] = {}
+    tokens: dict[str, int] = {}
+    for it in items:
+        for tool in it["tools"]:
+            per_tool[tool] = per_tool.get(tool, 0) + 1
+            if it["state"].get(tool, {}).get("value") not in ("off",):
+                tokens[tool] = tokens.get(tool, 0) + it["tokens"]["alwaysOn"]
+        cat = it["taxonomy"]["category"]
+        per_cat[cat] = per_cat.get(cat, 0) + 1
+    return {"skills": len(items), "perTool": per_tool, "perCategory": per_cat,
+            "alwaysOnTokens": tokens}
+
+
+# -------------------------------------------------------------------- main
+
+def _category_order_command(store: dict, args) -> int:
+    """The shelf order itself: read it, replace it whole, or move one entry.
+
+    Any manual change -- a full `set` or a single `move` -- puts the shelves
+    into custom mode, the way a drag does: count-desc and count-asc are entered
+    explicitly through `sort-mode` and never guessed from the array's shape.
+    """
+    known = known_categories(store)
+    known_set = set(known)
+
+    if args.order_action == "get":
+        sys.stdout.write(json.dumps({"order": known, "orderMode": store["orderMode"]},
+                                    ensure_ascii=False) + "\n")
+        return 0
+
+    if args.order_action == "set":
+        if not args.cats:
+            warn("name at least one category: `order set <cat...>` writes nothing empty")
+            return 2
+        seen: set = set()
+        order: list = []
+        for raw in args.cats:
+            name = raw.strip().lower()
+            if not CATEGORY_NAME.match(name):
+                warn("a category name is lower case letters, digits and dashes, up to 24")
+                return 2
+            if name not in known_set:
+                warn(f"{name} is not a category; create it first")
+                return 2
+            if name not in seen:
+                seen.add(name)
+                order.append(name)
+        store["order"] = order
+        store["orderMode"] = "custom"
+        if not _store_written(store):
+            return 2
+        print(f"order set: {' '.join(order)}")
+        return 0
+
+    # move
+    name = args.cat.strip().lower()
+    if not CATEGORY_NAME.match(name):
+        warn("a category name is lower case letters, digits and dashes, up to 24")
+        return 2
+    if name not in known_set:
+        warn(f"{name} is not a category; create it first")
+        return 2
+    cur = known.index(name)
+    raw_target = args.target.strip()
+    if raw_target in ("+1", "-1"):
+        new_index = cur + (1 if raw_target == "+1" else -1)
+    else:
+        try:
+            new_index = int(raw_target, 10)
+        except ValueError:
+            warn("move takes an index or +1/-1")
+            return 2
+    if new_index < 0 or new_index > len(known) - 1:
+        warn(f"move {name} to 0..{len(known) - 1}; nothing changed")
+        return 2
+    order = [c for c in known if c != name]
+    order.insert(new_index, name)
+    store["order"] = order
+    store["orderMode"] = "custom"
+    if not _store_written(store):
+        return 2
+    print(f"{name} moved to position {new_index}")
+    return 0
+
+
+def category_command(args) -> int:
+    """Every path here either makes the one change it was asked for and says so,
+    or changes nothing and says why. There is no partial outcome: the store is
+    read, edited in memory, validated, and written whole."""
+    store = read_store()
+
+    if args.action == "list":
+        sys.stdout.write(json.dumps({"custom": store["custom"], "assign": store["assign"],
+                                     "labels": store["labels"], "colors": store["colors"],
+                                     "order": known_categories(store),
+                                     "orderMode": store["orderMode"],
+                                     "hidePlacedBy": store["hidePlacedBy"],
+                                     "path": STORE_PATH, "known": known_categories(store)},
+                                    ensure_ascii=False) + "\n")
+        return 0
+
+    if args.action == "sort-mode":
+        mode = args.mode
+        if store["orderMode"] == mode:
+            print(f"already sorting {mode}")
+            return 0
+        # Only the mode moves. The stored order stays exactly as it was, so a
+        # return to custom restores the last manual layout rather than a
+        # recount of it.
+        store["orderMode"] = mode
+        if not _store_written(store):
+            return 2
+        print(f"sorting {mode}")
+        return 0
+
+    if args.action == "order":
+        return _category_order_command(store, args)
+
+    if args.action == "placed-by":
+        want = args.state == "hide"
+        if store["hidePlacedBy"] is want:
+            print("placed by is already " + ("hidden" if want else "shown"))
+            return 0
+        store["hidePlacedBy"] = want
+        if not _store_written(store):
+            return 2
+        print("placed by " + ("hidden on every card; `placed-by show` puts it back"
+                              if want else "back on every card"))
+        return 0
+
+    if args.action == "unassign":
+        skill = clip(args.skill, 128)
+        if skill not in store["assign"]:
+            warn(f"{skill} was not assigned to anything")
+            return 0
+        del store["assign"][skill]
+        if not _store_written(store):
+            return 2
+        print(f"{skill} goes back to the classifier")
+        return 0
+
+    if args.action == "create":
+        name = args.name.strip().lower()
+        if not CATEGORY_NAME.match(name):
+            warn("a category name is lower case letters, digits and dashes, up to 24")
+            return 2
+        if name in CATEGORIES:
+            warn(f"{name} is already one of the built-in categories")
+            return 2
+        if name not in store["custom"]:
+            if len(store["custom"]) >= MAX_CUSTOM_CATEGORIES:
+                warn(f"there is room for {MAX_CUSTOM_CATEGORIES} categories of your own")
+                return 2
+            store["custom"].append(name)
+        if not _apply_style(store, name, args.label, args.color):
+            return 2
+        if not _store_written(store):
+            return 2
+        print(f"{name} created")
+        return 0
+
+    if args.action == "style":
+        name = args.name.strip().lower()
+        if name not in known_categories(store):
+            warn(f"{name} is not a category; create it first")
+            return 2
+        if args.reset:
+            store["labels"].pop(name, None)
+            store["colors"].pop(name, None)
+            if not _store_written(store):
+                return 2
+            print(f"{name} back to its defaults")
+            return 0
+        if args.label is None and args.color is None:
+            warn("nothing to change: pass --label, --color or --reset")
+            return 1
+        if not _apply_style(store, name, args.label, args.color):
+            return 2
+        if not _store_written(store):
+            return 2
+        print(f"{name} restyled")
+        return 0
+
+    # assign
+    skill = args.skill
+    name = args.category.strip().lower()
+    if not skill:
+        warn("no skill named")
+        return 1
+    # Matched rather than cleaned, and matched before anything trims it. A name
+    # that had to be tidied up to get through is not the name of any directory,
+    # and filing a skill under a name nothing on disk has is a change nobody
+    # asked for -- the panel would report the move and the shelf stay empty.
+    if not SKILL_NAME.match(skill):
+        warn("a skill is named by its directory: anything but a slash, and not . or ..")
+        return 2
+    if not CATEGORY_NAME.match(name):
+        warn("a category name is lower case letters, digits and dashes, up to 24")
+        return 2
+    if name not in known_categories(store):
+        if not args.create:
+            warn(f"{name} is not a category; pass --create to make it one")
+            return 2
+        if len(store["custom"]) >= MAX_CUSTOM_CATEGORIES:
+            warn(f"there is room for {MAX_CUSTOM_CATEGORIES} categories of your own")
+            return 2
+        store["custom"].append(name)
+    if len(store["assign"]) >= MAX_ASSIGNMENTS and skill not in store["assign"]:
+        warn(f"there is room for {MAX_ASSIGNMENTS} assignments")
+        return 2
+    store["assign"][skill] = name
+    if not _store_written(store):
+        return 2
+    print(f"{skill} filed under {name}")
+    return 0
+
+
+def describe_command(args) -> int:
+    """One verb over one skill: the reader's own words about it, kept here.
+
+    A note opens no SKILL.md, moves no figure and is read by no agent. It is
+    drawn above the description on the card and the search reads it, and that is
+    the whole of what it does. Named by the directory alone, because a note is
+    per name and every copy of the name shows it.
+
+    One line of JSON either way, and either the one change it was asked for or
+    nothing at all.
+    """
+    skill = args.skill
+    # Matched before anything is read or written, and matched rather than
+    # cleaned: a name that had to be tidied up to get through is not the name of
+    # any directory, and a note filed under one is a note nothing will ever read.
+    if not SKILL_NAME.match(skill):
+        return _describe_says(False, "a skill is named by its directory: anything but a "
+                                     "slash, and not . or ..")
+    # An unreadable store says nothing in exactly the way an untouched machine
+    # does, and writing a note over one would take every other note with it.
+    unread: list = []
+    store = read_describe_store(unread)
+    if unread:
+        return _describe_says(False, "%s could not be read (%s), so nothing was written"
+                                     % (tilde(DESCRIBE_PATH), unread[0]["detail"]))
+    try:
+        return _describe_note(store, skill, args.text)
+    except Exception as exc:  # noqa: BLE001 - the caller is owed one line of JSON, always
+        # The panel reads one line and nothing else, so a traceback on stderr and
+        # an empty stdout reads to it as a failure it cannot name -- which is what
+        # a full disk, a quota or a read-only $HOME produced here.
+        detail = clip(getattr(exc, "strerror", None) or str(exc) or type(exc).__name__, 160)
+        return _describe_says(False, f"the change could not be finished: {detail}")
+
+
+def _describe_says(ok: bool, detail: str) -> int:
+    """One line, and the exit code the caller acts on: 0 done, 2 refused and
+    nothing written. There is no third code, because there is no third outcome --
+    an argument this program cannot use is a refusal like any other."""
+    sys.stdout.write(json.dumps({"ok": ok, "detail": detail}, ensure_ascii=False) + "\n")
+    return 0 if ok else 2
+
+
+def _describe_note(store: dict, skill: str, text: str) -> int:
+    """The reader's own annotation, kept here and shown above the description.
+
+    No SKILL.md is opened on any path through this, and nothing it stores appears
+    in any token figure: the agents never read this file. Empty text clears the
+    note rather than storing an empty one, because a field somebody emptied is a
+    field they are done with, and there is no other control for taking one back.
+    """
+    # Collapsed to one line before anything else, because a card draws it on one:
+    # a note that kept its line breaks would be one text in this file and another
+    # on the screen.
+    note = clip(" ".join(str(text or "").split()), MAX_NOTE)
+    if not note:
+        if store["notes"].pop(skill, None) is None:
+            return _describe_says(True, f"{skill} had no note, so there was none to clear")
+        write_describe_store(store)
+        return _describe_says(True, f"the note on {skill} is gone; no SKILL.md was opened")
+    if skill not in store["notes"] and len(store["notes"]) >= MAX_NOTES:
+        return _describe_says(False, f"there is room for {MAX_NOTES} notes")
+    store["notes"][skill] = note
+    write_describe_store(store)
+    return _describe_says(True, f"{skill} has a note of {len(note)} "
+                                f"character{'' if len(note) == 1 else 's'}, which is yours to "
+                                f"read and costs the agents nothing")
+
+
+def _description_in(text: str) -> str:
+    """The description this file text carries, read exactly as the scan reads it.
+
+    Every comparison in this feature is between one of these and another -- what
+    the file says against what we wrote, against what the row was drawn from --
+    so they all go through the one expression rather than three copies of it that
+    could drift apart.
+    """
+    return str(parse_frontmatter(text).get("description") or "").replace("\n", " ").strip()
+
+
+def _current_description(skill_md: str) -> str:
+    """The same, for a file that has not been read yet."""
+    text = read_text(skill_md)
+    return "" if text is None else _description_in(text)
+
+
+def _links_first(paths: list[str]) -> list[str]:
+    """Links before the directories they point at, whatever order they arrived in.
+
+    The scan already orders `removal.targets` this way and the panel passes them
+    through, but the guarantee belongs here too: removing a real directory while
+    a link from another root survives takes the row off the next scan entirely,
+    which leaves a dangling link and nothing left to click on. Stable, so paths
+    that sort the same keep the order the caller chose.
+    """
+    return sorted(paths, key=lambda p: not os.path.islink(p))
+
+
+# ------------------------------------------------------ writing a description
+#
+# The acting half of the store above, and the only place this program changes a
+# file somebody else wrote. What makes that defensible is how little it changes:
+# the value of the `description:` key and nothing else. The body, every other
+# key, the blank lines and the order they sit in all come through by slicing the
+# text around that one value, because re-serialising the frontmatter through any
+# writer would reformat a file whose shape was never ours to choose.
+
+# What a plain scalar may not be if it is to read back as the text it was given.
+# The first-character set is YAML's indicators; `: ` and ` #` end a plain scalar
+# in the middle of a line; and a word a reader takes for a boolean or a number
+# comes back as a value of the wrong type rather than as a short description.
+# Both the 1.1 and 1.2 spellings are here, because the three agents do not all
+# parse with the same library and the answer to write is the one nobody argues
+# about.
+YAML_INDICATORS = "-?:,[]{}#&*!|>'\"%@`"
+YAML_KEYWORDS = {"true", "false", "yes", "no", "on", "off", "null", "~"}
+
+
+def _commit_directory(directory: str) -> str:
+    """Make the rename itself survive a power cut, not just the bytes it renamed.
+
+    fsync on the temp file commits its contents; the link that gives it its name
+    lives in the parent directory and is a separate write. Without this step the
+    old state, a zero-length file, or nothing at all is a legal thing to find
+    after a crash -- which is the one outcome temp-then-rename is chosen to rule
+    out. Its own sentence, because a failure here is not the same failure as a
+    write that never landed: the new text IS on disk, and saying it "could not be
+    replaced" would be the one thing this program promises never to say.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        return clip(exc.strerror or exc, 96).lower()
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        return clip(exc.strerror or exc, 96).lower()
+    finally:
+        os.close(fd)
+    return ""
+
+
+def _frontmatter_besides_description(text: str) -> dict:
+    return {k: v for k, v in parse_frontmatter(text).items() if k != "description"}
+
+
+def _apply_style(store: dict, name: str, label, color) -> bool:
+    """Both fields or neither. A half-applied restyle would leave the store
+    saying one thing and the screen another, and the caller has no way to tell
+    which half landed."""
+    if label is not None:
+        label = label.strip()
+        if label == "":
+            store["labels"].pop(name, None)
+        elif CATEGORY_LABEL.match(label):
+            store["labels"][name] = clip(label, 32)
+        else:
+            warn("a label is one line, up to 32 characters")
+            return False
+    if color is not None:
+        color = color.strip()
+        if color == "":
+            store["colors"].pop(name, None)
+        elif HEX_COLOR.match(color):
+            store["colors"][name] = color.upper()
+        else:
+            warn("a colour is #RRGGBB")
+            return False
+    return True
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="agent-skills", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_scan = sub.add_parser("scan", help="full inventory across all three tools")
+    p_scan.add_argument("--divisor", type=int, default=4, choices=(3, 4),
+                        help="token estimate divisor (default 4, matching Claude Code)")
+    p_scan.add_argument("--pretty", action="store_true", help="indent the JSON")
+
+    sub.add_parser("doctor", help="human-readable health report on stdout")
+
+    # The write side. Four verbs, each one a single named change to one file
+    # under ~/.config/agent-skills, and every one of them runnable by hand. Nothing
+    # here reads or writes anything belonging to Claude Code, OpenCode or Codex.
+    p_cat = sub.add_parser("category", help="shelve skills without touching their files")
+    cat_sub = p_cat.add_subparsers(dest="action", required=True)
+
+    p_assign = cat_sub.add_parser("assign", help="move one skill into a category")
+    p_assign.add_argument("skill", help="the skill's directory name")
+    p_assign.add_argument("category", help="an existing category, or a new one with --create")
+    p_assign.add_argument("--create", action="store_true",
+                          help="create the category first if it does not exist")
+
+    p_unassign = cat_sub.add_parser("unassign", help="give a skill back to the classifier")
+    p_unassign.add_argument("skill")
+
+    p_create = cat_sub.add_parser("create", help="add a category of your own")
+    p_create.add_argument("name", help="lower case, digits and dashes, 24 characters")
+    p_create.add_argument("--label", default=None, help="how it reads in a group header")
+    p_create.add_argument("--color", default=None, help="#RRGGBB")
+
+    p_style = cat_sub.add_parser("style", help="rename or recolour any category")
+    p_style.add_argument("name")
+    p_style.add_argument("--label", default=None)
+    p_style.add_argument("--color", default=None)
+    p_style.add_argument("--reset", action="store_true",
+                         help="drop the label and colour and go back to the defaults")
+
+    # The one line on a card that answers a question you only ask once. Once you
+    # know a shelf is right, why it is right stops being news, so this turns it
+    # off -- on every card at once, because "how did this get here" is a question
+    # about the classifier rather than about any one skill, and answering it
+    # thirty-nine times is not an answer thirty-nine times over.
+    p_placed = cat_sub.add_parser("placed-by",
+                                  help="show or hide the line saying how each skill was filed")
+    p_placed.add_argument("state", choices=("show", "hide"))
+
+    p_order = cat_sub.add_parser("order", help="read or rearrange the shelf order")
+    order_sub = p_order.add_subparsers(dest="order_action", required=True)
+    order_sub.add_parser("get", help="print the shelf order and sort mode as JSON")
+    p_set = order_sub.add_parser("set", help="replace the shelf order whole (forces custom)")
+    p_set.add_argument("cats", nargs="*", help="category names in the order to keep them")
+    p_move = order_sub.add_parser("move", help="move one category (forces custom)")
+    p_move.add_argument("cat", help="the category to move")
+    p_move.add_argument("target", help="an index, or +1/-1 for one step")
+
+    p_sort = cat_sub.add_parser("sort-mode", help="how the shelves are drawn")
+    p_sort.add_argument("mode", choices=("count-desc", "count-asc", "custom"))
+
+    cat_sub.add_parser("list", help="print the store as JSON")
+
+    # The reader's own words about a skill, kept in this plugin's own file, read
+    # by nobody else and counted in no figure. It is the only thing this program
+    # writes outside the category store, and it is not anybody's SKILL.md: the
+    # description an agent reads is reported here and never rewritten.
+    p_desc = sub.add_parser("describe", help="keep your own note about a skill")
+    desc_sub = p_desc.add_subparsers(dest="action", required=True)
+
+    p_note = desc_sub.add_parser("note", help="your own words about a skill, shown above its "
+                                              "description and read by no agent")
+    p_note.add_argument("skill", help="the skill's directory name")
+    p_note.add_argument("text", nargs="?", default="",
+                        help=f"the note, up to {MAX_NOTE} characters; leave it out to "
+                             f"clear the one that is there")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "category":
+        return category_command(args)
+
+    if args.cmd == "describe":
+        return describe_command(args)
+
+    if args.cmd == "scan":
+        result = scan(divisor=args.divisor)
+        payload = json.dumps(result, indent=2 if args.pretty else None, ensure_ascii=False)
+        if len(payload.encode("utf-8")) > MAX_OUTPUT:
+            # Refuse rather than emit a truncated document the reader would parse
+            # as a whole one. The caller gets a valid, small, honest answer.
+            warn(f"scan output exceeded {MAX_OUTPUT} bytes; refusing to emit it")
+            payload = json.dumps({
+                "version": VERSION, "generatedAt": result["generatedAt"],
+                "items": [], "mcp": [], "plugins": [], "counts": result["counts"],
+                "findings": [{"what": "inventory",
+                              "detail": "too large to return; run agent-skills doctor in a terminal"}],
+            }, ensure_ascii=False)
+            sys.stdout.write(payload + "\n")
+            return 2
+        sys.stdout.write(payload + "\n")
+        return 0
+
+    if args.cmd == "doctor":
+        result = scan()
+        c = result["counts"]
+        print(f"agent-skills {VERSION}   scan {result['elapsedMs']} ms")
+        print(f"skills            {c['skills']}")
+        for tool, n in sorted(c["perTool"].items()):
+            print(f"  {tool:<14}{n:>4}   ~{c['alwaysOnTokens'].get(tool, 0)} tok always on")
+        print(f"mcp servers       {len(result['mcp'])}")
+        print(f"claude plugins    {len(result['plugins'])}")
+        up = [t for t, on in sorted(result["running"].items()) if on]
+        print("running now       " + (", ".join(up) if up else "none"))
+        print("categories        " + ", ".join(
+            f"{k} {v}" for k, v in sorted(result["counts"]["perCategory"].items(),
+                                          key=lambda kv: -kv[1])))
+        if result["findings"]:
+            print(f"\nneeds attention   {len(result['findings'])}")
+            for f in result["findings"]:
+                print(f"  {f['what']}: {f['detail']}")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
