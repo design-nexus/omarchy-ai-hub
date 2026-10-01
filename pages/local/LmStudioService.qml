@@ -4,10 +4,26 @@ import Quickshell.Io
 import qs.Commons
 import "Model.js" as Model
 
+// LM Studio's server, through its `lms` CLI. The Local page draws this and
+// OllamaService through one interface: the properties down to `busy`, and the
+// functions from toggleServer() on.
 Item {
   id: root
 
   property var settings: ({})
+  // Off when the Local tab or the LM Studio section is hidden: no polling.
+  property bool polling: true
+
+  readonly property string kind: "lmstudio"
+  readonly property string name: "LM Studio"
+  readonly property string notInstalledText: "LM Studio CLI not found"
+  readonly property string notInstalledHint: "Install LM Studio, or set lmsPath in the local settings"
+  readonly property string noModelsHint: "No models loaded. Load one below, or with 'lms load <model>'."
+  readonly property string openLabel: "Open"
+  readonly property string openTooltip: "Open LM Studio (O)"
+  readonly property bool canOpen: installed
+  readonly property bool canQuit: installed && serverRunning
+  readonly property string baseUrl: serverRunning ? "http://localhost:" + serverPort + "/v1" : ""
 
   // CLI detection
   property bool installed: false
@@ -21,10 +37,6 @@ Item {
   property var models: []
   property int modelCount: 0
   property var availableModels: []
-
-  // System resource usage (GPU/CPU/RAM), polled directly from the OS
-  property var resources: ({})
-  property var _prevResources: null
 
   // UI state
   property bool refreshing: false
@@ -137,6 +149,7 @@ Item {
   ].join("\n")
 
   function refresh(force) {
+    if (!polling) return
     if (!installed) {
       if (!whichProcess.running) {
         refreshing = true
@@ -185,8 +198,17 @@ Item {
     models = []
     modelCount = 0
     serverError = ""
-    resources = {}
-    _prevResources = null
+  }
+
+  onPollingChanged: {
+    if (polling) {
+      refresh()
+      return
+    }
+    resetServerState("Hidden")
+    availableModels = []
+    lastError = ""
+    actionStatus = ""
   }
 
   function parseServerStatusOutput(raw) {
@@ -267,7 +289,7 @@ Item {
 
   function copyServerBaseUrl() {
     if (!serverRunning) return
-    copyToClipboard("http://localhost:" + serverPort + "/v1", "LLM Server base URL")
+    copyToClipboard(baseUrl, "LLM Server base URL")
   }
 
   function unloadAllModels() {
@@ -275,17 +297,11 @@ Item {
     runAction(["unload", "--all"], "Unloading all models…")
   }
 
-  function refreshResources() {
-    if (!installed || resProcess.running) return
-    resProcess.command = ["bash", "-c", Model.RESOURCE_POLL_SCRIPT]
-    resProcess.running = true
-  }
-
-  function openLMStudio() {
+  function openApp() {
     Quickshell.execDetached(["gtk-launch", "lmstudio"])
   }
 
-  function quitLMStudio() {
+  function quitApp() {
     Quickshell.execDetached(["bash", "-c", "pkill -f lm-studio"])
   }
 
@@ -301,7 +317,7 @@ Item {
     id: refreshTimer
     interval: root.refreshIntervalSec * 1000
     repeat: true
-    running: true
+    running: root.polling
     triggeredOnStart: true
     onTriggered: root.refresh()
   }
@@ -312,7 +328,7 @@ Item {
     property int ticks: 0
     interval: 2000
     repeat: true
-    running: true
+    running: root.polling
     onTriggered: {
       ticks += 1
       if (root.serverRunning || ticks >= 15) startupRamp.running = false
@@ -435,21 +451,6 @@ Item {
       var stdout = String(lsStdout.text || "")
       if (exitCode === 0) root.availableModels = Model.parseLs(stdout)
       root.finishLms("ls")
-    }
-  }
-
-  // Process: system resource usage (GPU/CPU/RAM), polled from the OS
-  Process {
-    id: resProcess
-    running: false
-    command: []
-    stdout: StdioCollector { id: resStdout; waitForEnd: true }
-    stderr: StdioCollector { id: resStderr; waitForEnd: true }
-    onExited: function(exitCode) {
-      var stdout = String(resStdout.text || "")
-      var parsed = Model.parseResources(stdout, root._prevResources)
-      root._prevResources = parsed.next
-      if (parsed.gpuUtil >= 0 || parsed.ramTotal > 0) root.resources = parsed
     }
   }
 
