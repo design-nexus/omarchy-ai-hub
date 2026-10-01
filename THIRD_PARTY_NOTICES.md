@@ -6,7 +6,7 @@ MIT licensed; the copyright notice and permission notice below apply to its file
 | Page | Original plugin | Copyright holder |
 |---|---|---|
 | `pages/usage` | design-nexus.ai-usage | Design Nexus |
-| `pages/lmstudio` | design-nexus.lmstudio | Design Nexus |
+| `pages/local` (LM Studio) | design-nexus.lmstudio | Design Nexus |
 | `pages/live` | jankeesvw.herdr (https://github.com/jankeesvw/omarchy-herdr) | Jankees |
 | `pages/sessions` | sid.sessions | Sudhanshu Gautam |
 | `pages/skills` | oliwier.agent-skills-manager (https://github.com/oliwier-xiao/agent-skills-manager) | oliwier-xiao |

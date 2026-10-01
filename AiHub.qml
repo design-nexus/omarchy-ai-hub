@@ -8,32 +8,55 @@ import "pages/usage" as Usage
 import "pages/live" as Live
 import "pages/sessions" as Sessions
 import "pages/skills" as Skills
-import "pages/lmstudio" as LmStudio
+import "pages/local" as Local
 
 // One bar icon for every AI tool: usage and quotas, live herdr agents, past
-// sessions, loaded skills, and the LM Studio server. Each tab is a copy of
-// the original plugin, running unchanged except that its popup body renders
-// here (EmbeddedPanel) and its bar facade is a PageBar proxy.
+// sessions, loaded skills, and local model servers (LM Studio and Ollama).
+// Each tab is a copy of the original plugin, running unchanged except that
+// its popup body renders here (EmbeddedPanel) and its bar facade is a
+// PageBar proxy. Tabs can be hidden in the hub settings (the gear); a hidden
+// tab's page is not loaded at all, so it stops polling.
 BarWidget {
   id: root
   moduleName: "design-nexus.ai-hub"
 
-  readonly property var pageKeys: ["usage", "live", "sessions", "skills", "lmstudio"]
+  readonly property var pageKeys: ["usage", "live", "sessions", "skills", "local"]
   readonly property var pageTitles: ({
-    usage: "Usage", live: "Live", sessions: "Sessions", skills: "Skills", lmstudio: "LM Studio"
+    usage: "Usage", live: "Live", sessions: "Sessions", skills: "Skills", local: "Local"
   })
+
+  // Saved under the hub entry's `tabs` key as { usage: false, ... }; a tab
+  // missing from it is shown. At least one tab always stays visible.
+  readonly property var tabSettings: pageSettings("tabs")
+  function tabShown(key) { return tabSettings[key] !== false }
+  readonly property var visibleKeys: {
+    var keys = pageKeys.filter(function(key) { return root.tabShown(key) })
+    return keys.length > 0 ? keys : ["usage"]
+  }
+
+  // The Local page's servers, saved under `local`.
+  readonly property var localSettings: pageSettings("local")
+  readonly property bool lmStudioShown: localSettings.showLmStudio !== false
+  readonly property bool ollamaShown: localSettings.showOllama !== false
 
   property string currentKey: "usage"
   property bool popupOpen: false
   property bool popoutSwitchClosing: false
   property bool switching: false
   property var panels: ({})
-  readonly property var activePanel: panels[currentKey] || null
+  readonly property bool settingsShown: currentKey === "settings"
+  readonly property var activePanel: settingsShown ? null : (panels[currentKey] || null)
   readonly property bool activePanelShown: !!activePanel && activePanel.open
 
   readonly property color foreground: bar ? bar.barForeground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  readonly property var usagePage: usageLoader.item
+  readonly property var livePage: liveLoader.item
+  readonly property var sessionsPage: sessionsLoader.item
+  readonly property var skillsPage: skillsLoader.item
+  readonly property var localPage: localLoader.item
 
   // ------------------------------------------------------------ page host API
 
@@ -59,6 +82,15 @@ BarWidget {
     return shell.updateEntryInline(root.moduleName, next)
   }
 
+  // One value inside a page's settings object, keeping the rest of it.
+  function savePageSetting(key, name, value) {
+    var entry = {}
+    var current = pageSettings(key)
+    for (var k in current) entry[k] = current[k]
+    entry[name] = value
+    return savePageSettings(key, entry)
+  }
+
   function registerPanel(item) {
     if (!item || !item.pageKey || panels[item.pageKey] === item) return
     var next = {}
@@ -66,6 +98,13 @@ BarWidget {
     next[item.pageKey] = item
     panels = next
     if (item.open) pageOpenChanged(item)
+  }
+
+  function unregisterPanel(key) {
+    if (!(key in panels)) return
+    var next = {}
+    for (var k in panels) if (k !== key) next[k] = panels[k]
+    panels = next
   }
 
   function pageOpenChanged(item) {
@@ -85,24 +124,34 @@ BarWidget {
   }
 
   function focusActive() {
-    if (popupOpen && activePanel && activePanel.focusTarget) activePanel.focusTarget.forceActiveFocus()
+    if (!popupOpen) return
+    if (settingsShown) settingsView.forceActiveFocus()
+    else if (activePanel && activePanel.focusTarget) activePanel.focusTarget.forceActiveFocus()
   }
 
   // Tab / Shift+Tab from inside a page: next tab, then on past the ends to the
   // neighbouring bar panel.
   function cyclePage(direction) {
-    var i = pageKeys.indexOf(currentKey) + (direction < 0 ? -1 : 1)
-    if (i < 0 || i >= pageKeys.length) {
+    var i = visibleKeys.indexOf(currentKey) + (direction < 0 ? -1 : 1)
+    if (settingsShown) i = direction < 0 ? visibleKeys.length - 1 : 0
+    if (i < 0 || i >= visibleKeys.length) {
       return bar && typeof bar.switchPanelFrom === "function" ? bar.switchPanelFrom(root, direction) : false
     }
-    showPage(pageKeys[i])
+    showPage(visibleKeys[i])
     return true
+  }
+
+  function stepPage(direction) {
+    var keys = visibleKeys
+    var i = keys.indexOf(currentKey)
+    if (i < 0) i = direction > 0 ? -1 : 0
+    showPage(keys[(i + direction + keys.length) % keys.length])
   }
 
   // ------------------------------------------------------------ page adapters
 
   function entry(key) {
-    return ({ usage: usagePage, live: livePage, sessions: sessionsPage, skills: skillsPage, lmstudio: lmstudioPage })[key] || null
+    return ({ usage: usagePage, live: livePage, sessions: sessionsPage, skills: skillsPage, local: localPage })[key] || null
   }
 
   function pageIsOpen(key) {
@@ -133,10 +182,11 @@ BarWidget {
 
   // ------------------------------------------------------------ open / close
 
-  // Every fresh open lands on Usage; showPage() is the way to another tab.
+  // Every fresh open lands on Usage, or the first visible tab when Usage is
+  // hidden; showPage() is the way to another tab.
   function open() {
     if (popupOpen) return
-    currentKey = "usage"
+    currentKey = visibleKeys[0]
     popupOpen = true
     openPage(currentKey)
   }
@@ -158,7 +208,7 @@ BarWidget {
   }
 
   function showPage(key) {
-    if (pageKeys.indexOf(key) < 0) return
+    if (key !== "settings" && visibleKeys.indexOf(key) < 0) return
     if (key === currentKey && popupOpen) return
     switching = true
     if (popupOpen && key !== currentKey) closePage(currentKey)
@@ -169,38 +219,55 @@ BarWidget {
     Qt.callLater(focusActive)
   }
 
+  function toggleSettings() {
+    if (settingsShown && popupOpen) showPage(visibleKeys[0])
+    else showPage("settings")
+  }
+
   function refreshAll() {
-    usagePage.triggerRefresh(true)
-    livePage.refresh()
-    lmstudioPage.lmstudio.refresh()
+    if (usagePage) usagePage.triggerRefresh(true)
+    if (livePage) livePage.refresh()
+    if (localPage) localPage.refresh()
+  }
+
+  // A tab hidden while it is on screen hands over to the first visible one.
+  onVisibleKeysChanged: {
+    if (settingsShown || visibleKeys.indexOf(currentKey) >= 0) return
+    var next = visibleKeys[0]
+    if (popupOpen) Qt.callLater(function() { root.showPage(next) })
+    else currentKey = next
   }
 
   // ------------------------------------------------------------ bar summary
 
-  readonly property int liveBlocked: livePage.blockedCount
-  readonly property int liveDone: livePage.doneCount
-  readonly property int liveWorking: livePage.workingCount
-  readonly property color liveColor: liveBlocked > 0 ? urgent : (liveDone > 0 ? livePage.finished : livePage.working)
-  readonly property bool lmActive: lmstudioPage.lmstudio.active === true
+  readonly property int liveBlocked: livePage ? livePage.blockedCount : 0
+  readonly property int liveDone: livePage ? livePage.doneCount : 0
+  readonly property int liveWorking: livePage ? livePage.workingCount : 0
+  readonly property int liveAgents: livePage ? livePage.agentCount : 0
+  readonly property color liveColor: liveBlocked > 0 ? urgent : (!livePage ? foreground : (liveDone > 0 ? livePage.finished : livePage.working))
+  readonly property bool localActive: !!localPage && localPage.active === true
 
   function tabLabel(key) {
     var title = pageTitles[key]
-    if (key === "live" && livePage.agentCount > 0) return title + " " + livePage.agentCount
-    if (key === "lmstudio" && lmActive) return title + " ●"
+    if (key === "live" && liveAgents > 0) return title + " " + liveAgents
+    if (key === "local" && localActive) return title + " ●"
     return title
   }
 
   function tooltip() {
     var lines = ["AI hub"]
-    if (usagePage.activeSessionTotal > 0) lines.push(usagePage.activeSessionTotal + " active agent session" + (usagePage.activeSessionTotal === 1 ? "" : "s"))
-    if (livePage.agentCount > 0) {
+    if (usagePage && usagePage.activeSessionTotal > 0) lines.push(usagePage.activeSessionTotal + " active agent session" + (usagePage.activeSessionTotal === 1 ? "" : "s"))
+    if (liveAgents > 0) {
       var parts = []
       if (liveBlocked > 0) parts.push(liveBlocked + " waiting")
       if (liveWorking > 0) parts.push(liveWorking + " working")
       if (liveDone > 0) parts.push(liveDone + " done")
-      lines.push("herdr: " + livePage.agentCount + " agents" + (parts.length ? " (" + parts.join(", ") + ")" : ""))
+      lines.push("herdr: " + liveAgents + " agents" + (parts.length ? " (" + parts.join(", ") + ")" : ""))
     }
-    lines.push("LM Studio: " + (lmActive ? "running" : "stopped"))
+    if (localPage) {
+      if (lmStudioShown) lines.push("LM Studio: " + (localPage.lmstudio.active ? "running" : "stopped"))
+      if (ollamaShown) lines.push("Ollama: " + (localPage.ollama.active ? "running" : "stopped"))
+    }
     return lines.join("\n")
   }
 
@@ -209,25 +276,50 @@ BarWidget {
 
   // ------------------------------------------------------------ hosted pages
 
-  PageBar { id: usageBar; realBar: root.bar; pageHost: root; pageKey: "usage"; pageEntry: usagePage }
-  PageBar { id: liveBar; realBar: root.bar; pageHost: root; pageKey: "live"; pageEntry: livePage }
-  PageBar { id: sessionsBar; realBar: root.bar; pageHost: root; pageKey: "sessions"; pageEntry: sessionsPage }
-  PageBar { id: skillsBar; realBar: root.bar; pageHost: root; pageKey: "skills"; pageEntry: skillsPage }
-  PageBar { id: lmstudioBar; realBar: root.bar; pageHost: root; pageKey: "lmstudio"; pageEntry: lmstudioPage }
+  PageBar { id: usageBar; realBar: root.bar; pageHost: root; pageKey: "usage"; pageEntry: root.usagePage }
+  PageBar { id: liveBar; realBar: root.bar; pageHost: root; pageKey: "live"; pageEntry: root.livePage }
+  PageBar { id: sessionsBar; realBar: root.bar; pageHost: root; pageKey: "sessions"; pageEntry: root.sessionsPage }
+  PageBar { id: skillsBar; realBar: root.bar; pageHost: root; pageKey: "skills"; pageEntry: root.skillsPage }
+  PageBar { id: localBar; realBar: root.bar; pageHost: root; pageKey: "local"; pageEntry: root.localPage }
 
   // The pages' own bar buttons live here, never shown; only their popup
-  // bodies are reparented into the hub panel.
+  // bodies are reparented into the hub panel. Hidden tabs are not loaded.
   Item {
     id: pageHolder
     visible: false
     width: 0
     height: 0
 
-    Usage.Widget { id: usagePage; bar: usageBar; settings: root.pageSettings("usage") }
-    Live.Panel { id: livePage; bar: liveBar; settings: root.pageSettings("live") }
-    Sessions.BarWidget { id: sessionsPage; bar: sessionsBar; settings: root.pageSettings("sessions") }
-    Skills.BarWidget { id: skillsPage; bar: skillsBar; settings: root.pageSettings("skills") }
-    LmStudio.Panel { id: lmstudioPage; bar: lmstudioBar; settings: root.pageSettings("lmstudio") }
+    Loader {
+      id: usageLoader
+      active: root.tabShown("usage") || root.visibleKeys[0] === "usage"
+      onActiveChanged: if (!active) root.unregisterPanel("usage")
+      sourceComponent: Component { Usage.Widget { bar: usageBar; settings: root.pageSettings("usage") } }
+    }
+    Loader {
+      id: liveLoader
+      active: root.tabShown("live")
+      onActiveChanged: if (!active) root.unregisterPanel("live")
+      sourceComponent: Component { Live.Panel { bar: liveBar; settings: root.pageSettings("live") } }
+    }
+    Loader {
+      id: sessionsLoader
+      active: root.tabShown("sessions")
+      onActiveChanged: if (!active) root.unregisterPanel("sessions")
+      sourceComponent: Component { Sessions.BarWidget { bar: sessionsBar; settings: root.pageSettings("sessions") } }
+    }
+    Loader {
+      id: skillsLoader
+      active: root.tabShown("skills")
+      onActiveChanged: if (!active) root.unregisterPanel("skills")
+      sourceComponent: Component { Skills.BarWidget { bar: skillsBar; settings: root.pageSettings("skills") } }
+    }
+    Loader {
+      id: localLoader
+      active: root.tabShown("local")
+      onActiveChanged: if (!active) root.unregisterPanel("local")
+      sourceComponent: Component { Local.Panel { bar: localBar; settings: root.pageSettings("local") } }
+    }
   }
 
   IpcHandler {
@@ -238,8 +330,10 @@ BarWidget {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function page(name: string): string {
-      if (root.pageKeys.indexOf(name) < 0) return "unknown page: " + name + " (" + root.pageKeys.join(", ") + ")"
-      root.showPage(name)
+      var key = name === "lmstudio" || name === "ollama" ? "local" : name
+      if (key === "settings") { root.showPage(key); return "ok" }
+      if (root.visibleKeys.indexOf(key) < 0) return "unknown or hidden page: " + name + " (" + root.visibleKeys.join(", ") + ", settings)"
+      root.showPage(key)
       return "ok"
     }
     function refresh(): string { root.refreshAll(); return "ok" }
@@ -260,7 +354,7 @@ BarWidget {
 
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refreshAll()
-      else if (b === Qt.RightButton) root.showPage("lmstudio")
+      else if (b === Qt.RightButton && root.localPage) root.showPage("local")
       else root.toggle()
     }
 
@@ -298,7 +392,7 @@ BarWidget {
 
         // Provider activity dots, as the usage widget drew them.
         Repeater {
-          model: usagePage.allProviders
+          model: root.usagePage && root.tabShown("usage") ? root.usagePage.allProviders : []
           delegate: Rectangle {
             required property var modelData
             required property int index
@@ -320,12 +414,12 @@ BarWidget {
         }
       }
 
-      // Active agent count (usage badge mode), then herdr state and LM Studio.
+      // Active agent count (usage badge mode), then herdr state and the local servers.
       Text {
         anchors.verticalCenter: parent.verticalCenter
         visible: text !== ""
         textFormat: Text.PlainText
-        text: usagePage.badgeText
+        text: root.usagePage && root.tabShown("usage") ? root.usagePage.badgeText : ""
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -334,7 +428,7 @@ BarWidget {
 
       Rectangle {
         anchors.verticalCenter: parent.verticalCenter
-        visible: livePage.badgeActive
+        visible: !!root.livePage && root.livePage.badgeActive
         width: 5
         height: 5
         radius: 2.5
@@ -343,7 +437,7 @@ BarWidget {
 
       Rectangle {
         anchors.verticalCenter: parent.verticalCenter
-        visible: root.lmActive
+        visible: root.localActive
         width: 5
         height: 5
         radius: 2.5
@@ -363,13 +457,14 @@ BarWidget {
     bar: root.bar
     open: root.popupOpen
     padding: 0
-    focusTarget: root.activePanel ? root.activePanel.focusTarget : null
+    focusTarget: root.settingsShown ? settingsView : (root.activePanel ? root.activePanel.focusTarget : null)
     // One width for every tab: the Usage page's 390, or just enough for the tab
     // strip at its widest labels if that is more. Pages fill it; none sets it.
     contentWidth: panel.fittedContentWidth(Math.max(Style.space(390),
-      tabSizer.implicitWidth + Style.space(12) * 2 + root.borderInsetH))
+      tabSizer.implicitWidth + settingsButton.width + Style.space(12) * 3 + root.borderInsetH))
     contentHeight: root.borderInsetV + tabRow.height
-      + (root.activePanelShown ? root.activePanel.contentHeight : placeholder.implicitHeight)
+      + (root.settingsShown ? settingsView.implicitHeight
+        : (root.activePanelShown ? root.activePanel.contentHeight : placeholder.implicitHeight))
 
     // Page switching that works whatever the page does with its own keys.
     Item {
@@ -379,24 +474,28 @@ BarWidget {
       Shortcut {
         sequences: ["Ctrl+Tab", "Ctrl+PgDown"]
         enabled: root.popupOpen
-        onActivated: root.showPage(root.pageKeys[(root.pageKeys.indexOf(root.currentKey) + 1) % root.pageKeys.length])
+        onActivated: root.stepPage(1)
       }
       Shortcut {
         sequences: ["Ctrl+Shift+Tab", "Ctrl+Backtab", "Ctrl+PgUp"]
         enabled: root.popupOpen
-        onActivated: root.showPage(root.pageKeys[(root.pageKeys.indexOf(root.currentKey) + root.pageKeys.length - 1) % root.pageKeys.length])
+        onActivated: root.stepPage(-1)
       }
       Repeater {
-        model: root.pageKeys
+        model: 5
         delegate: Item {
-          required property string modelData
           required property int index
           Shortcut {
             sequence: "Alt+" + (index + 1)
-            enabled: root.popupOpen
-            onActivated: root.showPage(modelData)
+            enabled: root.popupOpen && index < root.visibleKeys.length
+            onActivated: root.showPage(root.visibleKeys[index])
           }
         }
+      }
+      Shortcut {
+        sequence: "Alt+0"
+        enabled: root.popupOpen
+        onActivated: root.toggleSettings()
       }
     }
 
@@ -416,8 +515,8 @@ BarWidget {
           focusable: false
           fontFamily: root.fontFamily
           fontSize: Style.font.bodySmall
-          options: root.pageKeys.map(function(key) {
-            return key === "live" ? "Live 00" : (key === "lmstudio" ? "LM Studio \u25CF" : root.pageTitles[key])
+          options: root.visibleKeys.map(function(key) {
+            return key === "live" ? "Live 00" : (key === "local" ? "Local ●" : root.pageTitles[key])
           })
         }
 
@@ -431,10 +530,28 @@ BarWidget {
           fontSize: Style.font.bodySmall
           foreground: Color.foreground
           value: root.currentKey
-          options: root.pageKeys.map(function(key) {
+          options: root.visibleKeys.map(function(key) {
             return { value: key, label: root.tabLabel(key) }
           })
           onChanged: function(value) { root.showPage(value) }
+        }
+
+        Button {
+          id: settingsButton
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(12)
+          anchors.verticalCenter: parent.verticalCenter
+          width: tabs.implicitHeight
+          height: tabs.implicitHeight
+          horizontalPadding: 0
+          verticalPadding: 0
+          iconText: "󰒓"
+          iconSize: Style.font.iconSmall
+          foreground: Color.foreground
+          fontFamily: root.fontFamily
+          hasCursor: root.settingsShown
+          tooltipText: root.settingsShown ? "Back (Alt+0)" : "Hub settings (Alt+0)"
+          onClicked: root.toggleSettings()
         }
       }
 
@@ -449,14 +566,14 @@ BarWidget {
         Column {
           id: placeholder
           anchors.centerIn: parent
-          visible: !root.activePanelShown
+          visible: !root.settingsShown && !root.activePanelShown
           spacing: Style.space(8)
           padding: Style.space(24)
 
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
-            text: root.currentKey === "live" && livePage.pinned ? "herdr is pinned to the desktop" : "Loading…"
+            text: root.currentKey === "live" && root.livePage && root.livePage.pinned ? "herdr is pinned to the desktop" : "Loading…"
             color: Color.foreground
             opacity: 0.7
             font.family: root.fontFamily
@@ -465,10 +582,19 @@ BarWidget {
 
           Button {
             anchors.horizontalCenter: parent.horizontalCenter
-            visible: root.currentKey === "live" && livePage.pinned
+            visible: root.currentKey === "live" && !!root.livePage && root.livePage.pinned
             text: "Unpin"
-            onClicked: livePage.togglePin()
+            onClicked: root.livePage.togglePin()
           }
+        }
+
+        HubSettings {
+          id: settingsView
+          visible: root.settingsShown
+          width: parent.width
+          hub: root
+          foreground: Color.foreground
+          fontFamily: root.fontFamily
         }
       }
     }

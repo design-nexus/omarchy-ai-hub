@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Design Nexus",
   "license": "MIT",
-  "description": "One bar icon for AI tooling: usage and quotas, live herdr agents, past sessions, loaded skills, and the LM Studio server. Combines design-nexus.ai-usage, jankeesvw.herdr, sid.sessions, oliwier.agent-skills-manager and design-nexus.lmstudio.",
+  "description": "One bar icon for AI tooling: usage and quotas, live herdr agents, past sessions, loaded skills, and local model servers (LM Studio and Ollama). Tabs and servers can each be hidden. Combines design-nexus.ai-usage, jankeesvw.herdr, sid.sessions, oliwier.agent-skills-manager and design-nexus.lmstudio.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "AI Hub",
-    "description": "Usage, live agents, sessions, skills and LM Studio behind one icon. Left click opens, right click jumps to LM Studio, middle click refreshes.",
+    "description": "Usage, live agents, sessions, skills and local models behind one icon. Left click opens, right click jumps to Local, middle click refreshes. The gear in the panel hides tabs.",
     "category": "AI",
     "aliases": [
       "ai",
@@ -25,7 +25,10 @@
       "herdr",
       "lmstudio",
       "claude",
-      "codex"
+      "codex",
+      "ollama",
+      "local",
+      "llm"
     ],
     "allowMultiple": false,
     "defaultSection": "left",

@@ -1,4 +1,4 @@
-// LM Studio Model.js - Pure JavaScript module for QML import
+// Local page model helpers (LM Studio and Ollama) - pure JavaScript for QML import
 
 // LM Studio CLI path getter (respects settings)
 function getLmsPath(settings) {
@@ -89,6 +89,7 @@ function humanStatus(status) {
     if (s === "idle") return "Idle"
     if (s === "busy") return "Busy (generating)"
     if (s === "loading") return "Loading..."
+    if (s === "loaded") return "Loaded"
     return s.charAt(0).toUpperCase() + s.slice(1)
 }
 
@@ -220,46 +221,128 @@ function aggregateStats(models) {
     return { vramBytes: vram, ramBytes: ram, maxContextLength: ctx }
 }
 
-/**
- * Shell script (run via `bash -c`) that samples system resource usage in one
- * pass. Emits tab-separated `key<TAB>value` lines that parseResources reads:
- *
- *   gpu\t<util%>,<usedMiB>,<totalMiB>      whole-GPU util + VRAM (nvidia-smi)
- *   vram\t<pid>,<usedMiB>                  per-process VRAM for llama-server
- *   ram\t<usedKB> <availKB> <totalKB>      system RAM from /proc/meminfo
- *   stat\tcpu  <...>                       raw /proc/stat aggregate line
- *   ncpu\t<count>
- *   proc\t<pid>\t<rssKB> <utime+stime>     llama-server process (or -\t-\t-)
- *
- * All reads are permitted for the current user; no sudo required.
- */
-var RESOURCE_POLL_SCRIPT = [
-    "PID=$(pgrep -f 'llama-server' | head -1)",
-    "printf 'gpu\\t'; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true",
-    "if [ -n \"$PID\" ]; then",
-    "  VRAM=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | grep \"^$PID,\" | head -1)",
-    "  if [ -n \"$VRAM\" ]; then printf 'vram\\t%s\\n' \"$VRAM\"; fi",
-    "fi",
-    "printf 'ram\\t'; awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf \"%d %d %d\\n\", t-a, a, t}' /proc/meminfo",
-    "printf 'stat\\t'; grep '^cpu ' /proc/stat",
-    "printf 'ncpu\\t%s\\n' \"$(nproc)\"",
-    "if [ -n \"$PID\" ]; then",
-    "  printf 'proc\\t%s\\t' \"$PID\"",
-    "  awk '/^VmRSS:/{printf \"%d \", $2}' /proc/$PID/status",
-    "  awk '{for(i=1;i<=NF;i++){if($i ~ /\\)/){s=i;break}} print $(s+12)+$(s+13)}' /proc/$PID/stat",
-    "else printf 'proc\\t-\\t-\\t-'",
-    "fi"
-].join("\n")
+// ── Ollama ───────────────────────────────────────────────────────────────
+
+// Ollama names carry their registry: "hf.co/google/gemma-…:Q4_0" or a library
+// name like "qwen3:8b". Show them without the registry host and ":latest".
+function ollamaDisplayName(name) {
+    var n = String(name || "")
+    n = n.replace(/^hf\.co\//, "").replace(/^registry\.ollama\.ai\/library\//, "")
+    n = n.replace(/:latest$/, "")
+    // Hugging Face names lead with the publisher, which the card shows as a logo.
+    if (/^hf\.co\//.test(String(name || ""))) n = n.replace(/^[^\/]+\//, "")
+    return n
+}
+
+// Library models have no publisher in their name; guess it from the family
+// so the card can show a brand logo. Unknown families fall back to Ollama's.
+var OLLAMA_FAMILY_PUBLISHERS = {
+    "llama": "meta", "mllama": "meta",
+    "gemma": "google", "gemma2": "google", "gemma3": "google", "gemma3n": "google", "gemma4": "google",
+    "qwen": "qwen", "qwen2": "qwen", "qwen2moe": "qwen", "qwen3": "qwen", "qwen3moe": "qwen", "qwen25vl": "qwen",
+    "mistral": "mistralai", "mistral3": "mistralai", "mixtral": "mistralai",
+    "deepseek2": "deepseek", "deepseek3": "deepseek",
+    "phi2": "microsoft", "phi3": "microsoft", "phi4": "microsoft",
+    "command-r": "cohere", "granite": "ibm", "nomic-bert": "nomic"
+}
+
+function ollamaPublisher(name, family) {
+    var n = String(name || "")
+    var hf = /^hf\.co\/([^\/]+)\//.exec(n)
+    if (hf) return hf[1]
+    var slash = n.indexOf("/")
+    if (slash > 0 && n.indexOf("registry.ollama.ai") !== 0) return n.substring(0, slash)
+    var f = String(family || "").toLowerCase()
+    return OLLAMA_FAMILY_PUBLISHERS[f] || "ollama"
+}
+
+function quantOf(details) {
+    var q = details && details.quantization_level ? String(details.quantization_level) : ""
+    return q.toLowerCase() === "unknown" ? "" : q
+}
 
 /**
- * Parse one resource poll payload.
- * `prev` is the `next` object from the previous call (stat/proc snapshots) or
- * null on the first tick. CPU% and per-process CPU% are deltas against the
- * previous snapshot, exactly how btop computes them; the first tick therefore
- * reports -1 for both until a second sample exists.
+ * Parse GET /api/tags. Returns { options: [{ value, label, description }],
+ * info: { name: { embed, quantization, contextLength } } }
+ */
+function parseOllamaTags(raw) {
+    var out = { options: [], info: {} }
+    try {
+        var data = JSON.parse(String(raw || "").trim() || "{}")
+        var list = Array.isArray(data.models) ? data.models : []
+        for (var i = 0; i < list.length; i++) {
+            var m = list[i] || {}
+            var name = String(m.name || m.model || "")
+            if (name === "") continue
+            var d = m.details || {}
+            var caps = Array.isArray(m.capabilities) ? m.capabilities : []
+            var embed = caps.indexOf("embedding") !== -1
+                || (caps.indexOf("completion") === -1 && /bert|embed/i.test(String(d.family || "") + name))
+            var parts = []
+            if (d.parameter_size) parts.push(String(d.parameter_size))
+            if (quantOf(d)) parts.push(quantOf(d))
+            var size = parseInt(m.size || 0, 10)
+            if (isFinite(size) && size > 0) parts.push(formatBytes(size))
+            if (embed) parts.push("embedding")
+            out.options.push({ value: name, label: ollamaDisplayName(name), description: parts.join(" • ") })
+            out.info[name] = { embed: embed, quantization: quantOf(d), contextLength: parseInt(d.context_length || 0, 10) || 0 }
+        }
+    } catch (e) {
+        console.warn("Ollama: Failed to parse tags:", e)
+    }
+    return out
+}
+
+/**
+ * Parse GET /api/ps into the same model shape parsePs produces for LM Studio.
+ * `info` is parseOllamaTags().info, used for what /api/ps leaves out.
+ */
+function parseOllamaPs(raw, info) {
+    var result = []
+    try {
+        var data = JSON.parse(String(raw || "").trim() || "{}")
+        var list = Array.isArray(data.models) ? data.models : []
+        info = info || {}
+        for (var i = 0; i < list.length; i++) {
+            var m = list[i] || {}
+            var name = String(m.name || m.model || "")
+            if (name === "") continue
+            var d = m.details || {}
+            var known = info[name] || {}
+            var size = parseInt(m.size || 0, 10) || 0
+            var vram = parseInt(m.size_vram || 0, 10) || 0
+            result.push({
+                identifier: name,
+                displayName: ollamaDisplayName(name),
+                sizeBytes: size,
+                vramBytes: vram,
+                ramBytes: Math.max(0, size - vram),
+                status: "loaded",
+                contextLength: parseInt(m.context_length || 0, 10) || 0,
+                quantization: quantOf(d) || known.quantization || "",
+                architecture: String(d.family || ""),
+                publisher: ollamaPublisher(name, d.family),
+                paramsString: String(d.parameter_size || ""),
+                embed: known.embed === true,
+                expiresAt: String(m.expires_at || "")
+            })
+        }
+    } catch (e) {
+        console.warn("Ollama: Failed to parse ps:", e)
+    }
+    return result
+}
+
+// ── Resources ────────────────────────────────────────────────────────────
+
+/**
+ * Parse one bin/local-resources sample.
+ * `prev` is the `next` object from the previous call, or null on the first.
+ * CPU percentages are deltas against the previous sample, as btop computes
+ * them, so the first sample reports -1 until a second one exists.
  *
  * Returns: { gpuUtil, vramUsed, vramTotal, ramUsed, ramTotal, cpuPct,
- *            procCpuPct, procRss, procPid, next }  (-1 = no data yet)
+ *            procs: { <server>: { cpuPct, rss } }, next }   (-1 = no data)
  */
 function parseResources(raw, prev) {
     var map = {}
@@ -270,20 +353,10 @@ function parseResources(raw, prev) {
     }
     prev = prev || {}
     var out = {
-        gpuUtil: -1,
-        vramUsed: -1,
-        vramTotal: -1,
-        ramUsed: 0,
-        ramTotal: 0,
-        cpuPct: -1,
-        procCpuPct: -1,
-        procRss: 0,
-        procPid: 0,
-        next: {
-            stat: prev.stat || null,
-            proc: prev.proc || null,
-            ncpu: parseInt(map.ncpu || prev.ncpu || 1, 10) || 1
-        }
+        gpuUtil: -1, vramUsed: -1, vramTotal: -1,
+        ramUsed: 0, ramTotal: 0, cpuPct: -1,
+        procs: {},
+        next: { stat: prev.stat || null, procs: {}, ncpu: parseInt(map.ncpu || prev.ncpu || 1, 10) || 1 }
     }
 
     var g = (map.gpu || "").split(",")
@@ -292,8 +365,6 @@ function parseResources(raw, prev) {
         out.vramUsed = parseInt(g[1], 10) * 1048576
         out.vramTotal = parseInt(g[2], 10) * 1048576
     }
-    var v = (map.vram || "").split(",")
-    if (v.length >= 2) out.vramUsed = parseInt(v[1], 10) * 1048576
 
     var r = (map.ram || "").split(/\s+/)
     if (r.length === 3) {
@@ -309,28 +380,28 @@ function parseResources(raw, prev) {
         var old = prev.stat
         if (old && tot > old.tot) {
             var dt = tot - old.tot
-            var di = idle - old.idle
-            if (dt > 0) out.cpuPct = Math.round((dt - di) * 100 / dt)
+            out.cpuPct = Math.round((dt - (idle - old.idle)) * 100 / dt)
         }
         out.next.stat = { tot: tot, idle: idle }
     }
 
-    var p = (map.proc || "").split(/\s+/)
-    if (p.length >= 3 && p[0] !== "-") {
-        var pid = parseInt(p[0], 10)
-        out.procPid = pid
-        out.procRss = (parseInt(p[1], 10) || 0) * 1024
-        var pt = parseInt(p[2], 10)
-        var oldProc = prev.proc
-        var oldStat = prev.stat
-        if (oldProc && oldStat && out.next.stat && oldProc.pid === pid) {
-            var dproc = pt - oldProc.ticks
-            var dtot = out.next.stat.tot - oldStat.tot
-            if (dtot > 0 && dproc >= 0) {
-                out.procCpuPct = Math.round(dproc * out.next.ncpu * 100 / dtot)
-            }
+    var prevProcs = prev.procs || {}
+    for (var key in map) {
+        if (key.indexOf("proc_") !== 0) continue
+        var name = key.substring(5)
+        var f = map[key].split(/\s+/)
+        if (f.length < 3) continue
+        var pids = f[0]
+        var ticks = parseInt(f[2], 10) || 0
+        var proc = { cpuPct: -1, rss: (parseInt(f[1], 10) || 0) * 1024 }
+        var was = prevProcs[name]
+        if (was && was.pids === pids && prev.stat && out.next.stat) {
+            var dtot = out.next.stat.tot - prev.stat.tot
+            var dproc = ticks - was.ticks
+            if (dtot > 0 && dproc >= 0) proc.cpuPct = Math.round(dproc * out.next.ncpu * 100 / dtot)
         }
-        out.next.proc = { pid: pid, ticks: pt }
+        out.procs[name] = proc
+        out.next.procs[name] = { pids: pids, ticks: ticks }
     }
     return out
 }
@@ -345,7 +416,10 @@ if (typeof module !== "undefined") {
         totalMemoryBytes: totalMemoryBytes,
         parseLs: parseLs,
         aggregateStats: aggregateStats,
-        RESOURCE_POLL_SCRIPT: RESOURCE_POLL_SCRIPT,
+        ollamaDisplayName: ollamaDisplayName,
+        ollamaPublisher: ollamaPublisher,
+        parseOllamaTags: parseOllamaTags,
+        parseOllamaPs: parseOllamaPs,
         parseResources: parseResources,
         publisherLogoSlug: publisherLogoSlug,
         logoColorSuffix: logoColorSuffix,

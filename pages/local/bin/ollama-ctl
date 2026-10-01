@@ -1,0 +1,77 @@
+#!/bin/bash
+# ollama-ctl — everything the Local page asks of Ollama, one subcommand a call.
+#
+#   probe               print the server's version JSON, or nothing when down
+#   ps                  loaded models (GET /api/ps)
+#   tags                models on disk (GET /api/tags)
+#   start | stop        the server: its systemd unit (user first, then system),
+#                       or a detached `ollama serve` when there is no unit
+#   load MODEL [embed]  load MODEL and keep it loaded until unloaded
+#   unload MODEL [embed]
+#
+# The server address comes from OLLAMA_URL (default http://127.0.0.1:11434).
+# Embedding models cannot answer /api/generate, so they load and unload
+# through /api/embed instead; the caller says which a model is.
+
+set -uo pipefail
+
+host=${OLLAMA_URL:-http://127.0.0.1:11434}
+host=${host%/}
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+unit_scope() {
+  if systemctl --user cat ollama.service >/dev/null 2>&1; then echo user
+  elif systemctl cat ollama.service >/dev/null 2>&1; then echo system
+  fi
+}
+
+# Model names travel inside a JSON string; refuse anything that would need
+# escaping rather than escape it.
+valid_model() { [[ $1 =~ ^[A-Za-z0-9._:/@+-]+$ ]]; }
+
+# POST a body and turn an {"error": "..."} reply into a failed exit.
+post() {
+  local path=$1 body=$2 timeout=$3 out
+  out=$(curl -sS --max-time "$timeout" -H 'Content-Type: application/json' \
+    -d "$body" "$host$path" 2>&1) || die "${out:-request failed}"
+  if [[ $out == *'"error"'* ]]; then
+    die "$(printf '%s' "$out" | sed -n 's/.*"error" *: *"\([^"]*\)".*/\1/p')"
+  fi
+}
+
+keep() {
+  local model=$1 kind=${2:-} alive=$3 timeout=$4
+  valid_model "$model" || die "unsupported model name: $model"
+  if [[ $kind == embed ]]; then
+    post /api/embed "{\"model\":\"$model\",\"input\":\"\",\"keep_alive\":$alive}" "$timeout"
+  else
+    post /api/generate "{\"model\":\"$model\",\"keep_alive\":$alive}" "$timeout"
+  fi
+}
+
+case "${1:-}" in
+  probe) curl -s --max-time 1 "$host/api/version" ;;
+  ps) curl -sS --max-time 3 "$host/api/ps" ;;
+  tags) curl -sS --max-time 5 "$host/api/tags" ;;
+  start)
+    case "$(unit_scope)" in
+      user) systemctl --user start ollama.service ;;
+      system) systemctl start ollama.service ;;
+      *)
+        command -v ollama >/dev/null 2>&1 || die "ollama is not installed"
+        OLLAMA_HOST=$host setsid -f ollama serve >/dev/null 2>&1 </dev/null
+        ;;
+    esac
+    ;;
+  stop)
+    case "$(unit_scope)" in
+      user) systemctl --user stop ollama.service ;;
+      system) systemctl stop ollama.service ;;
+      *) pkill -u "$(id -u)" -f '^(/usr/(local/)?bin/)?ollama serve' || die "no ollama serve process of yours is running" ;;
+    esac
+    ;;
+  load) keep "${2:-}" "${3:-}" -1 600 ;;
+  unload) keep "${2:-}" "${3:-}" 0 30 ;;
+  *) die "usage: ollama-ctl probe|ps|tags|start|stop|load MODEL [embed]|unload MODEL [embed]" ;;
+esac

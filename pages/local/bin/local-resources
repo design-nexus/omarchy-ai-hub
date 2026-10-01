@@ -1,0 +1,35 @@
+#!/bin/bash
+# local-resources — one sample of system and model-server resource use, as
+# tab-separated `key<TAB>value` lines for Model.parseResources:
+#
+#   gpu    <util%>,<usedMiB>,<totalMiB>   first NVIDIA GPU (nvidia-smi), if any
+#   ram    <usedKB> <availKB> <totalKB>   /proc/meminfo
+#   stat   cpu  <...>                     raw /proc/stat aggregate line
+#   ncpu   <count>
+#   proc_<server>  <pid,pid,...>  <rssKB> <utime+stime ticks>
+#
+# A server's processes are summed: Ollama runs one llama-server per loaded
+# model beside `ollama serve`, and LM Studio loads models in its node worker.
+# Everything read here is readable without root.
+
+printf 'gpu\t%s\n' "$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
+printf 'ram\t'; awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf "%d %d %d\n", t-a, a, t}' /proc/meminfo
+printf 'stat\t'; grep '^cpu ' /proc/stat
+printf 'ncpu\t%s\n' "$(nproc)"
+
+proc() {
+  local name=$1 pattern=$2 rss=0 ticks=0 ids="" pid r t
+  for pid in $(pgrep -f "$pattern"); do
+    [[ -r /proc/$pid/stat ]] || continue
+    r=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+    t=$(awk '{for(i=1;i<=NF;i++){if($i ~ /\)$/){s=i;break}} print $(s+12)+$(s+13)}' "/proc/$pid/stat" 2>/dev/null)
+    rss=$((rss + ${r:-0}))
+    ticks=$((ticks + ${t:-0}))
+    ids+="$pid,"
+  done
+  [[ -n $ids ]] && printf '%s\t%s\t%s %s\n' "$name" "$ids" "$rss" "$ticks"
+}
+
+proc proc_lmstudio '[.]lmstudio/[.]internal/utils/node'
+proc proc_ollama '/ollama/llama-serve[r]|ollama runne[r]|ollama serv[e]'
+exit 0
