@@ -1154,17 +1154,19 @@ def pb_fields(buf: bytes):
             return  # groups/unknown: stop rather than misparse
 
 
-def today_token_usage(conversations_dir: Path, today: dt.date) -> int:
+def today_token_usage(conversations_dir: Path, today: dt.date) -> tuple[int, int]:
     """Tokens used today, from each conversation's step metadata.
 
     A model-response step's metadata records when it ran (field 1, seconds)
     and a usage block (field 9): 2 = uncached input, 5 = cached input,
     3 = output (thinking + response). Only databases written today are read.
+    Returns (uncached input + output, cached input).
     """
     if not conversations_dir.exists():
-        return 0
+        return 0, 0
     start = dt.datetime.combine(today, dt.time()).timestamp()
     total = 0
+    cached = 0
     for db in conversations_dir.glob("*.db"):
         try:
             wal = db.with_name(db.name + "-wal")
@@ -1187,10 +1189,11 @@ def today_token_usage(conversations_dir: Path, today: dt.date) -> int:
                 if dict(pb_fields(when)).get(1, 0) < start:
                     continue
                 u = dict(pb_fields(usage))
-                total += sum(v for k, v in u.items() if k in (2, 3, 5) and isinstance(v, int))
+                total += sum(v for k, v in u.items() if k in (2, 3) and isinstance(v, int))
+                cached += u.get(5, 0) if isinstance(u.get(5, 0), int) else 0
             except (IndexError, TypeError):
                 continue
-    return total
+    return total, cached
 
 
 def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None) -> dict[str, Any]:
@@ -1218,6 +1221,7 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
     brain_dir = base_dir / "brain"
 
     today_date = dt.datetime.now().date()
+    today_tokens, today_cached = today_token_usage(base_dir / "conversations", today_date)
     today_str = date_string(today_date)
     recent_dates = recent_date_strings()
 
@@ -1504,7 +1508,8 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         "todayPrompts": daily_prompts.get(today_str, 0),
         "todaySessions": today_db_sessions or (1 if has_active_session else 0),
         "todaySteps": today_db_steps,
-        "todayTotalTokens": today_token_usage(base_dir / "conversations", today_date),
+        "todayTotalTokens": today_tokens,
+        "todayCachedTokens": today_cached,
         "todayTokensByModel": {},
         "recentDays": recent_days_data,
         "totalPrompts": total_prompts_hist,

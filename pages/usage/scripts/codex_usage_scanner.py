@@ -590,6 +590,8 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
     today_prompts = 0
     today_steps = 0
     today_tokens = 0
+    today_cached = 0
+    today_cached_by_model: dict[str, int] = {}
     total_prompts = 0
     total_steps = 0
 
@@ -682,8 +684,10 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
                     if day == today_str:
                         today_steps += 1
                         today_tokens += turn_total
+                        today_cached += cached_tok
                         bucket["todaySteps"] += 1
                         today_tokens_by_model[current_model] = today_tokens_by_model.get(current_model, 0) + turn_total
+                        today_cached_by_model[current_model] = today_cached_by_model.get(current_model, 0) + cached_tok
         except Exception:
             continue
         if sid:
@@ -768,7 +772,9 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
         "todaySessions": sum(1 for m in file_meta.values() if local_date_from_timestamp(m["mtime"]) == today_str),
         "todaySteps": today_steps,
         "todayTotalTokens": today_tokens,
+        "todayCachedTokens": today_cached,
         "todayTokensByModel": today_tokens_by_model,
+        "todayCachedByModel": today_cached_by_model,
         "recentDays": [recent_days_map[d] for d in recent_dates],
         "totalPrompts": total_prompts,
         "totalSteps": total_steps,

@@ -30,6 +30,7 @@ Item {
   property var activeSessions: data.activeSessions || []
   property int todayPrompts: Number(data.todayPrompts || 0)
   property int todayTotalTokens: Number(data.todayTotalTokens || 0)
+  property real todayCachedTokens: Number(data.todayCachedTokens || 0)
   property int todaySteps: Number(data.todaySteps || 0)
   property int totalPrompts: Number(data.totalPrompts || 0)
   property var recentDays: data.recentDays || []

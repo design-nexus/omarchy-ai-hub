@@ -592,6 +592,8 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
     today_prompts = 0
     today_steps = 0
     today_tokens = 0
+    today_cached = 0
+    today_cached_by_model: dict[str, int] = {}
     total_prompts = 0
     total_steps = 0
 
@@ -619,7 +621,7 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
                     in_tok = int(usage.get("inputTokens") or 0)
                     out_tok = int(usage.get("outputTokens") or 0)
                     cached_tok = int(usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens") or 0)
-                    total_tok = in_tok + out_tok + cached_tok
+                    total_tok = in_tok + out_tok
 
                     meta = entry.get("_meta") if isinstance(entry.get("_meta"), dict) else {}
                     ts = meta.get("agentTimestampMs") or entry.get("timestamp")
@@ -662,9 +664,11 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
                         today_prompts += 1
                         today_steps += 1
                         today_tokens += total_tok
+                        today_cached += cached_tok
                         bucket["todayPrompts"] += 1
                         bucket["todaySteps"] += 1
                         today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + total_tok
+                        today_cached_by_model[m] = today_cached_by_model.get(m, 0) + cached_tok
         except Exception:
             continue
 
@@ -726,7 +730,9 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
         "todaySessions": len(res["activeSessions"]) if has_active else (1 if today_prompts > 0 else 0),
         "todaySteps": today_steps,
         "todayTotalTokens": today_tokens,
+        "todayCachedTokens": today_cached,
         "todayTokensByModel": today_tokens_by_model,
+        "todayCachedByModel": today_cached_by_model,
         "recentDays": [recent_days_map[d] for d in recent_dates],
         "totalPrompts": total_prompts,
         "totalSessions": len(sessions),

@@ -77,6 +77,8 @@ def blank_model(name: str) -> dict:
         "inputTokens": 0,
         "outputTokens": 0,
         "cachedTokens": 0,
+        "todayTokens": 0,
+        "todayCachedTokens": 0,
         "color": COLOR,
     }
 
@@ -388,12 +390,17 @@ def apply_metrics(session: dict, models: dict[str, dict], today: dt.date, week: 
         row = models.setdefault(str(name), blank_model(str(name)))
         input_tokens = int(usage.get("inputTokens") or usage.get("input_tokens") or 0)
         output_tokens = int(usage.get("outputTokens") or usage.get("output_tokens") or 0)
-        cached = int(usage.get("cacheReadTokens") or usage.get("cache_read_tokens") or 0)
-        cached += int(usage.get("cacheWriteTokens") or usage.get("cache_write_tokens") or 0)
+        cache_read = int(usage.get("cacheReadTokens") or usage.get("cache_read_tokens") or 0)
+        cache_write = int(usage.get("cacheWriteTokens") or usage.get("cache_write_tokens") or 0)
+        cached = cache_read + cache_write
         row["inputTokens"] += input_tokens
         row["outputTokens"] += output_tokens
         row["cachedTokens"] += cached
-        session["tokenCount"] += input_tokens + output_tokens + cached
+        # Headline tokens exclude cache reads, which are reported apart.
+        session["tokenCount"] += input_tokens + output_tokens + cache_write
+        if when == today:
+            row["todayTokens"] += input_tokens + output_tokens + cache_write
+            row["todayCachedTokens"] += cache_read
         if not session["model"]:
             session["model"] = str(name)
         if key in week:
@@ -412,6 +419,7 @@ def apply_usage_rows(rows: list, sessions: dict[str, dict], models: dict[str, di
         incoming = int(input_tokens or 0)
         outgoing = int(output_tokens or 0)
         cached = int(cache_read or 0) + int(cache_write or 0)
+        fresh = incoming + outgoing + int(cache_write or 0)
         row["inputTokens"] += incoming
         row["outputTokens"] += outgoing
         row["cachedTokens"] += cached
@@ -419,10 +427,12 @@ def apply_usage_rows(rows: list, sessions: dict[str, dict], models: dict[str, di
         when = local_day(stamp(created_at)) or today
         if when == today:
             row["todaySteps"] += 1
+            row["todayTokens"] += fresh
+            row["todayCachedTokens"] += int(cache_read or 0)
         if str(when) in week:
             row["weekSteps"] += 1
         session = sessions.setdefault(str(session_id), blank_session(str(session_id)))
-        session["tokenCount"] += incoming + outgoing + cached
+        session["tokenCount"] += fresh
         session["model"] = session["model"] or name
         session["updated_ts"] = max(session["updated_ts"], stamp(created_at))
     return seen
@@ -493,6 +503,8 @@ def scan(home: Path) -> dict:
         session.pop("updated_ts", None)
     model_list = sorted(models.values(), key=lambda item: (item["prompts"], item["steps"], item["name"]), reverse=True)
     total_tokens = sum(item["tokenCount"] for item in visible)
+    today_tokens = sum(item["todayTokens"] for item in model_list)
+    today_cached = sum(item["todayCachedTokens"] for item in model_list)
     days = []
     for offset in range(6, -1, -1):
         day = str(today - dt.timedelta(days=offset))
@@ -516,8 +528,10 @@ def scan(home: Path) -> dict:
         "todayPrompts": daily_prompts[str(today)],
         "todaySessions": sum(1 for item in visible if str(item.get("updated_at", "")).startswith(str(today))),
         "todaySteps": daily_steps[str(today)],
-        "todayTotalTokens": total_tokens,
-        "todayTokensByModel": {item["name"]: item["inputTokens"] + item["outputTokens"] + item["cachedTokens"] for item in model_list},
+        "todayTotalTokens": today_tokens,
+        "todayCachedTokens": today_cached,
+        "todayTokensByModel": {item["name"]: item["todayTokens"] for item in model_list},
+        "todayCachedByModel": {item["name"]: item["todayCachedTokens"] for item in model_list},
         "recentDays": days,
         "totalPrompts": sum(daily_prompts.values()),
         "totalSessions": len(visible),

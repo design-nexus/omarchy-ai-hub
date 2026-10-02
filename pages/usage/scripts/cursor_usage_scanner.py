@@ -57,6 +57,8 @@ def blank_model(name: str) -> dict:
         "inputTokens": 0,
         "outputTokens": 0,
         "cachedTokens": 0,
+        "todayTokens": 0,
+        "todayCachedTokens": 0,
         "color": COLOR,
     }
 
@@ -305,14 +307,20 @@ def read_jsonl(path: Path, session: dict, tools: Counter, models: dict[str, dict
             input_tokens = int(usage.get("input_tokens") or usage.get("inputTokens") or 0)
             output_tokens = int(usage.get("output_tokens") or usage.get("outputTokens") or 0)
             cached = int(usage.get("cache_read_input_tokens") or usage.get("cacheReadTokens") or 0)
-            cached += int(usage.get("cache_creation_input_tokens") or usage.get("cacheWriteTokens") or 0)
+            cache_write = int(usage.get("cache_creation_input_tokens") or usage.get("cacheWriteTokens") or 0)
+            cache_read = cached
+            cached += cache_write
             if input_tokens or output_tokens or cached:
                 target_name = model or session["model"] or "Cursor"
                 row = models.setdefault(target_name, blank_model(target_name))
                 row["inputTokens"] += input_tokens
                 row["outputTokens"] += output_tokens
                 row["cachedTokens"] += cached
-                session["tokenCount"] += input_tokens + output_tokens + cached
+                # Headline tokens exclude cache reads, which are reported apart.
+                session["tokenCount"] += input_tokens + output_tokens + cache_write
+                if (local_day(stamp(obj.get("timestamp"))) or local_day(when)) == today:
+                    row["todayTokens"] += input_tokens + output_tokens + cache_write
+                    row["todayCachedTokens"] += cache_read
             content = message.get("content", obj.get("content"))
             if isinstance(content, list):
                 for block in content:
@@ -592,8 +600,10 @@ def scan(data_home: Path, config_home: Path) -> dict:
         "todayPrompts": daily_prompts[str(today)],
         "todaySessions": sum(1 for item in visible if str(item.get("updated_at", "")).startswith(str(today))),
         "todaySteps": daily_steps[str(today)],
-        "todayTotalTokens": sum(item["tokenCount"] for item in visible),
-        "todayTokensByModel": {item["name"]: item["inputTokens"] + item["outputTokens"] + item["cachedTokens"] for item in model_list},
+        "todayTotalTokens": sum(item["todayTokens"] for item in model_list),
+        "todayCachedTokens": sum(item["todayCachedTokens"] for item in model_list),
+        "todayTokensByModel": {item["name"]: item["todayTokens"] for item in model_list},
+        "todayCachedByModel": {item["name"]: item["todayCachedTokens"] for item in model_list},
         "recentDays": days,
         "totalPrompts": sum(daily_prompts.values()),
         "totalSessions": len(visible),
