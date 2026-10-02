@@ -487,6 +487,12 @@ def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -
         if key in week:
             row["weekSteps"] += 1
 
+    # One API message is written as several transcript rows (one per content
+    # block), each repeating the same usage; count every message once.
+    seen_messages: set[tuple[str, str]] = set()
+    today_tokens: Counter = Counter()
+    today_cached: Counter = Counter()
+
     projects = base / "projects"
     paths = projects.glob("**/*.jsonl") if projects.exists() else []
     for path in paths:
@@ -523,16 +529,29 @@ def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -
                     clean = format_claude_model_name(str(seen))
                     if clean:
                         model = clean
+                msg_key = (str(message.get("id") or ""), str(row.get("requestId") or ""))
+                duplicate = bool(msg_key[0] or msg_key[1]) and msg_key in seen_messages
                 if role == "assistant" and model and seen != "<synthetic>":
-                    add_step(model, day)
+                    if not duplicate:
+                        add_step(model, day)
                     while pending:
                         add_prompt(model, pending.pop(0))
-                usage = message.get("usage") or row.get("usage") or {}
+                usage = {} if duplicate else (message.get("usage") or row.get("usage") or {})
+                if msg_key[0] or msg_key[1]:
+                    seen_messages.add(msg_key)
                 input_tokens = int(usage.get("input_tokens") or 0)
                 output_tokens = int(usage.get("output_tokens") or 0)
-                cached = int(usage.get("cache_read_input_tokens") or 0) + int(usage.get("cache_creation_input_tokens") or 0)
-                piece = input_tokens + output_tokens + cached
-                tokens += piece
+                cache_read = int(usage.get("cache_read_input_tokens") or 0)
+                cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+                cached = cache_read + cache_write
+                # Headline tokens exclude cache reads (the context re-read on
+                # every turn); those are reported separately.
+                fresh = input_tokens + output_tokens + cache_write
+                piece = fresh + cache_read
+                tokens += fresh
+                if day == today and model:
+                    today_tokens[model] += fresh
+                    today_cached[model] += cache_read
                 if piece and model:
                     target = bucket(model)
                     target["inputTokens"] += input_tokens
@@ -589,7 +608,8 @@ def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -
         match = next((item for item in sessions if not item["isActive"] and (not cwd or item["workspace"] == cwd)), None)
         if match:
             match["isActive"] = True
-    total_tokens = sum(item["tokenCount"] for item in sessions)
+    total_tokens = sum(today_tokens.values())
+    total_cached = sum(today_cached.values())
     total_prompts = sum(daily_prompts.values())
     total_steps = sum(daily_steps.values())
     model_list = sorted(models.values(), key=lambda item: (item["prompts"], item["steps"], item["name"]), reverse=True)
@@ -635,7 +655,9 @@ def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -
         "todaySessions": sum(1 for item in sessions if str(item["updated_at"]).startswith(str(today))),
         "todaySteps": daily_steps[str(today)],
         "todayTotalTokens": total_tokens,
-        "todayTokensByModel": {item["name"]: item["inputTokens"] + item["outputTokens"] + item["cachedTokens"] for item in model_list},
+        "todayCachedTokens": total_cached,
+        "todayTokensByModel": dict(today_tokens),
+        "todayCachedByModel": dict(today_cached),
         "recentDays": recent_days(today, daily_prompts, daily_steps),
         "totalPrompts": total_prompts,
         "totalSessions": len(sessions),
