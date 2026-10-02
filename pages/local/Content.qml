@@ -276,7 +276,9 @@ Panel {
             color: root.dim()
             font.family: root.fontFamily()
             font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            wrapMode: Text.NoWrap
+            fontSizeMode: Text.HorizontalFit
+            minimumPixelSize: 8
             horizontalAlignment: Text.AlignHCenter
           }
         }

@@ -5895,35 +5895,35 @@ Panel {
             var cur = root.currentRow()
             var picks = cur && cur.rowType !== "header"
               && root.pickerOptions(cur.view).length > 0
-            var parts = [typing ? "Backspace to erase" : "Type to search"]
-            parts.push("Enter to open")
+            var parts = [typing ? "⌫ erase" : "type to search"]
+            parts.push("↵ open")
             // The promise changes with the row, because on a row that documents
             // actions Ctrl+C does not copy: it asks which one.
-            parts.push(picks ? "^C to pick an action" : "^C to copy")
+            parts.push(picks ? "^C pick action" : "^C copy")
             // Only where there is something to open. Named for the control it
             // opens rather than for what you do in there: the card's chip says
             // note, this key opens the same window, and one act with two names
             // is one the reader has to map.
             var dsc = cur && cur.rowType !== "header" ? root.describeOf(cur) : null
-            if (dsc) parts.push("^D for a note")
+            if (dsc) parts.push("^D note")
             if (cur && cur.rowType !== "header" && cur.view && cur.view.updateFacts)
-              parts.push("^A to ask about updates")
-            parts.push("^G to regroup")
-            parts.push("^R to rescan")
+              parts.push("^A updates")
+            parts.push("^G regroup")
+            parts.push("^R rescan")
             parts.push(root.expandedKey !== "" || typing || root.anyChipFilter
-              ? "Esc to go back" : "Esc to close")
+              ? "esc back" : "esc close")
             return parts.join("  \u00b7  ")
           }
           color: root.soft
           font.family: root.face
           font.pixelSize: Style.font.caption
-          // Wraps to a second line before it elides. On a row whose description
-          // this panel wrote, this line carries two more promises than it does
-          // elsewhere, and a hint cut off at the right edge is the panel keeping
-          // a key to itself.
-          wrapMode: Text.WordWrap
-          maximumLineCount: 2
-          elide: Text.ElideRight
+          // One line, shrunk to fit rather than wrapped or cut off: on a row
+          // whose description this panel wrote the hint carries more promises,
+          // and a hint cut off at the right edge is the panel keeping a key to
+          // itself.
+          wrapMode: Text.NoWrap
+          fontSizeMode: Text.HorizontalFit
+          minimumPixelSize: 8
         }
       }
 
