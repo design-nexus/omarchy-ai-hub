@@ -729,6 +729,9 @@ BarWidget {
             FooterText {
               visible: root.cardsVisible(root.provider)
               text: "j/k scroll · 1-5 resume · n new · r refresh · s settings · q/esc close"
+              wrapMode: Text.NoWrap
+              fontSizeMode: Text.HorizontalFit
+              minimumPixelSize: 8
             }
 
             SettingsContent {

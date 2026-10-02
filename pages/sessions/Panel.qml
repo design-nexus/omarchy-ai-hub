@@ -574,7 +574,9 @@ Panel {
             width: parent.width
             anchors.verticalCenter: parent.verticalCenter
             horizontalAlignment: Text.AlignRight
-            wrapMode: Text.WordWrap
+            wrapMode: Text.NoWrap
+            fontSizeMode: Text.HorizontalFit
+            minimumPixelSize: 8
             text: "↵ resume · p peek · o folder · y copy · d delete ×2 · ←/→ agent · r rescan · esc"
             color: root.dimmed
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
