@@ -3,6 +3,7 @@ import QtQml.Models
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "../.."
 
@@ -66,8 +67,8 @@ Panel {
     return false
   }
 
-  readonly property color fg: Color.popups.text
-  readonly property color hue: Color.accent
+  readonly property color fg: Commons.Color.popups.text
+  readonly property color hue: Commons.Color.accent
   readonly property string face: bar ? bar.fontFamily : Style.font.family
   // Util.alpha, not Qt.darker: on a light theme Qt.darker makes a dimmed step
   // more prominent than the foreground, and on all-black text every level of
@@ -3248,7 +3249,7 @@ Panel {
       visible: gr.group.attention > 0
       textFormat: Text.PlainText
       text: String(gr.group.attention)
-      color: Color.urgent
+      color: Commons.Color.urgent
       font.family: root.face
       font.pixelSize: Style.font.caption
     }
@@ -3600,7 +3601,7 @@ Panel {
         height: width
         radius: width / 2
         visible: er.view.attention.length > 0
-        color: er.broken ? Color.urgent : root.soft
+        color: er.broken ? Commons.Color.urgent : root.soft
       }
     }
 
@@ -3822,7 +3823,7 @@ Panel {
               visible: descBlock.known && descBlock.desc.handEdited === true
               textFormat: Text.PlainText
               text: "SKILL.md has changed since this panel wrote its description, so the author's own cannot be put back from here."
-              color: Color.urgent
+              color: Commons.Color.urgent
               font.family: root.face
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
@@ -3856,7 +3857,7 @@ Panel {
                 width: parent.width
                 textFormat: Text.PlainText
                 text: "•  " + modelData
-                color: er.broken ? Color.urgent : root.readable
+                color: er.broken ? Commons.Color.urgent : root.readable
                 font.family: root.face
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
@@ -4003,7 +4004,7 @@ Panel {
                 width: parent.width
                 textFormat: Text.PlainText
                 text: "drifted from  " + modelData
-                color: Color.urgent
+                color: Commons.Color.urgent
                 font.family: root.face
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideMiddle
@@ -4428,7 +4429,7 @@ Panel {
             anchors.bottomMargin: -Style.spacing.xs
             radius: height / 2
             visible: !controls.parked
-            color: Color.popups.background
+            color: Commons.Color.popups.background
 
             // The card is not the panel: it is the panel's background with the
             // row's own fill laid over it, so a ground painted in the panel
@@ -5023,7 +5024,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
             text: root.attentionOnly ? "needs attention" : ""
-            color: Color.urgent
+            color: Commons.Color.urgent
             font.family: root.face
             font.pixelSize: Style.font.caption
           }
@@ -5404,8 +5405,8 @@ Panel {
                 height: Style.space(24)
                 radius: Style.cornerRadius
                 color: {
-                  var base = countChip.urgent ? Color.urgent : root.fg
-                  if (countChip.on) return Util.alpha(countChip.urgent ? Color.urgent : root.hue, 0.30)
+                  var base = countChip.urgent ? Commons.Color.urgent : root.fg
+                  if (countChip.on) return Util.alpha(countChip.urgent ? Commons.Color.urgent : root.hue, 0.30)
                   if (countHover.hovered) return Util.alpha(base, 0.16)
                   return Util.alpha(base, countChip.urgent ? 0.14 : 0.07)
                 }
@@ -5419,7 +5420,7 @@ Panel {
                     anchors.verticalCenter: parent.verticalCenter
                     textFormat: Text.PlainText
                     text: String(countChip.modelData.n)
-                    color: countChip.urgent ? Color.urgent : root.fg
+                    color: countChip.urgent ? Commons.Color.urgent : root.fg
                     font.family: root.face
                     font.pixelSize: Style.font.bodySmall
                     font.bold: true
@@ -5429,7 +5430,7 @@ Panel {
                     anchors.verticalCenter: parent.verticalCenter
                     textFormat: Text.PlainText
                     text: countChip.modelData.what
-                    color: countChip.urgent ? Color.urgent
+                    color: countChip.urgent ? Commons.Color.urgent
                       : (countChip.on || countHover.hovered ? root.readable : root.soft)
                     font.family: root.face
                     font.pixelSize: Style.font.caption
@@ -5513,9 +5514,9 @@ Panel {
           // Three tones, because three different things get said here and they
           // are not equally good news. A refused copy used to arrive in the same
           // accent as a successful one.
-          readonly property color tint: root.scanError !== "" ? Color.urgent
+          readonly property color tint: root.scanError !== "" ? Commons.Color.urgent
             : (root.toast === "" ? root.fg
-              : (root.toastTone === "error" ? Color.urgent : root.hue))
+              : (root.toastTone === "error" ? Commons.Color.urgent : root.hue))
 
           sourceComponent: BorderSurface {
             implicitHeight: stripText.implicitHeight + Style.spacing.xxl * 2
@@ -5535,7 +5536,7 @@ Panel {
               textFormat: Text.PlainText
               text: strip.message
               color: root.scanError !== "" || root.toastTone === "error"
-                ? Color.urgent : root.strong
+                ? Commons.Color.urgent : root.strong
               font.family: root.face
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
@@ -5977,7 +5978,7 @@ Panel {
         // point of a picker is that there is one thing on screen to answer.
         Rectangle {
           anchors.fill: parent
-          color: Color.popups.background
+          color: Commons.Color.popups.background
           // Swallows the click rather than passing it to the row underneath,
           // and leaves the same way Escape and the back button do rather than
           // by its own route: with an editor open, a stray click on the scrim

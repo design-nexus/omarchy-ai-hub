@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // The hub's own settings (the gear in the tab row): which tabs show, and
@@ -9,7 +10,7 @@ FocusScope {
   id: root
 
   property var hub: null
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
 
   readonly property color dim: HubStyle.dimOf(foreground)

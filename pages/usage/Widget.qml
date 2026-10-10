@@ -5,6 +5,7 @@ import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "../.."
 
@@ -26,10 +27,10 @@ BarWidget {
 
   // ---------------------------------------------------------------- Theme
   // Built-in bar icons use barForeground; foreground can be a dimmed text role.
-  readonly property color foreground: (bar && bar.barForeground) ? bar.barForeground : ((bar && bar.foreground) ? bar.foreground : Color.foreground)
-  readonly property color background: (Color.popups && Color.popups.background) ? Color.popups.background : Color.background
-  readonly property color urgent: (bar && bar.urgent) ? bar.urgent : Color.urgent
-  readonly property color accent: (bar && bar.accent) ? bar.accent : Color.accent
+  readonly property color foreground: (bar && bar.barForeground) ? bar.barForeground : ((bar && bar.foreground) ? bar.foreground : Commons.Color.foreground)
+  readonly property color background: (Commons.Color.popups && Commons.Color.popups.background) ? Commons.Color.popups.background : Commons.Color.background
+  readonly property color urgent: (bar && bar.urgent) ? bar.urgent : Commons.Color.urgent
+  readonly property color accent: (bar && bar.accent) ? bar.accent : Commons.Color.accent
   readonly property color onAccent: background
   readonly property color warn: mix(urgent, foreground, 0.45)
   readonly property color dim: Qt.darker(foreground, 1.45)

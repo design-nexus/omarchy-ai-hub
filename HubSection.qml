@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // The AI Usage section card: faint fill, hairline border, a bold section title.
@@ -7,7 +8,7 @@ BorderSurface {
   id: root
 
   property string title: ""
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
   property Component headerAccessory: null
   default property alias content: body.data

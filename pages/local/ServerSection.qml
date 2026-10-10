@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "../.."
 import "Model.js" as Model
@@ -19,8 +20,8 @@ Column {
   property var resources: ({})
   property bool opened: false
   property Item keyCatcher: null
-  property color foreground: Color.foreground
-  property color urgentColor: Color.urgent
+  property color foreground: Commons.Color.foreground
+  property color urgentColor: Commons.Color.urgent
   property string fontFamily: Style.font.family
 
   property bool cursorActive: false
@@ -514,9 +515,9 @@ Column {
     id: modelCard
     required property var modelData
     required property int index
-    property color barForeground: Color.foreground
-    property color barDim: Qt.darker(Color.foreground, 1.55)
-    property color barUrgent: Color.urgent
+    property color barForeground: Commons.Color.foreground
+    property color barDim: Qt.darker(Commons.Color.foreground, 1.55)
+    property color barUrgent: Commons.Color.urgent
     property string fontFamily: Style.font.family
     property bool loadRemote: true
 

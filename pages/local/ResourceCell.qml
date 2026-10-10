@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import qs.Commons
+import qs.Commons as Commons
 
 // One resource reading: icon, label and value on a line, with an optional
 // usage bar under it (fraction 0..1; below 0 hides the bar).
@@ -11,7 +12,7 @@ Column {
   property string label: ""
   property string value: ""
   property real fraction: -1
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
 
   readonly property color dim: Qt.darker(foreground, 1.4)

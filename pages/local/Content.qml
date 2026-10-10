@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "../.."
 import "Model.js" as Model
@@ -33,8 +34,8 @@ Panel {
   property var resources: ({})
   property var _prevResources: null
 
-  function foreground() { return (bar && bar.foreground) ? bar.foreground : Color.foreground }
-  function urgent() { return (bar && bar.urgent) ? bar.urgent : Color.urgent }
+  function foreground() { return (bar && bar.foreground) ? bar.foreground : Commons.Color.foreground }
+  function urgent() { return (bar && bar.urgent) ? bar.urgent : Commons.Color.urgent }
   function dim() { return Qt.darker(foreground(), 1.55) }
   function fontFamily() { return (bar && bar.fontFamily) ? bar.fontFamily : Style.font.family }
 
@@ -322,7 +323,7 @@ Panel {
         }
 
         background: BorderSurface {
-          color: Color.background
+          color: Commons.Color.background
           borderSpec: Border.flat(root.dim(), 1)
           radius: Style.cornerRadius
         }
