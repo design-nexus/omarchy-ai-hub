@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 // Publisher brand logo for a model card, mirroring LM Studio's model
@@ -12,7 +13,7 @@ Item {
 
   property string publisher: ""
   property string label: ""
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
   property bool loadRemote: true
 

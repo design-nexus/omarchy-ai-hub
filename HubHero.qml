@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // Page header in the AI Usage style, with PanelHero's API so hosted pages can
 // swap it in by type name: icon, bold title with an optional status pill
@@ -12,7 +13,7 @@ Item {
   property string meta: ""
   property string detail: ""
   property bool detailActive: false
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
   property real iconSize: HubStyle.iconSize
   property real iconOpacity: 1.0

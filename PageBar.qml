@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // The bar facade handed to one hosted page. Presentation state mirrors the
 // real bar; everything that would make the page act like a bar widget of its
@@ -13,10 +14,10 @@ QtObject {
   property string pageKey: ""
   property var pageEntry: null
 
-  readonly property color foreground: realBar ? realBar.foreground : Color.foreground
-  readonly property color barForeground: realBar ? realBar.barForeground : Color.foreground
-  readonly property color background: realBar ? realBar.background : Color.background
-  readonly property color urgent: realBar ? realBar.urgent : Color.urgent
+  readonly property color foreground: realBar ? realBar.foreground : Commons.Color.foreground
+  readonly property color barForeground: realBar ? realBar.barForeground : Commons.Color.foreground
+  readonly property color background: realBar ? realBar.background : Commons.Color.background
+  readonly property color urgent: realBar ? realBar.urgent : Commons.Color.urgent
   readonly property string fontFamily: realBar ? realBar.fontFamily : Style.font.family
   readonly property string position: realBar ? realBar.position : "top"
   readonly property bool vertical: realBar ? realBar.vertical : false

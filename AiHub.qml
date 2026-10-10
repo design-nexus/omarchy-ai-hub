@@ -3,6 +3,7 @@ import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "pages/usage" as Usage
 import "pages/live" as Live
@@ -48,8 +49,8 @@ BarWidget {
   readonly property var activePanel: settingsShown ? null : (panels[currentKey] || null)
   readonly property bool activePanelShown: !!activePanel && activePanel.open
 
-  readonly property color foreground: bar ? bar.barForeground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.barForeground : Commons.Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property var usagePage: usageLoader.item
@@ -528,7 +529,7 @@ BarWidget {
           focusable: false
           fontFamily: root.fontFamily
           fontSize: Style.font.bodySmall
-          foreground: Color.foreground
+          foreground: Commons.Color.foreground
           value: root.currentKey
           options: root.visibleKeys.map(function(key) {
             return { value: key, label: root.tabLabel(key) }
@@ -547,7 +548,7 @@ BarWidget {
           verticalPadding: 0
           iconText: "󰒓"
           iconSize: Style.font.iconSmall
-          foreground: Color.foreground
+          foreground: Commons.Color.foreground
           fontFamily: root.fontFamily
           hasCursor: root.settingsShown
           tooltipText: root.settingsShown ? "Back (Alt+0)" : "Hub settings (Alt+0)"
@@ -574,7 +575,7 @@ BarWidget {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
             text: root.currentKey === "live" && root.livePage && root.livePage.pinned ? "herdr is pinned to the desktop" : "Loading…"
-            color: Color.foreground
+            color: Commons.Color.foreground
             opacity: 0.7
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -593,7 +594,7 @@ BarWidget {
           visible: root.settingsShown
           width: parent.width
           hub: root
-          foreground: Color.foreground
+          foreground: Commons.Color.foreground
           fontFamily: root.fontFamily
         }
       }

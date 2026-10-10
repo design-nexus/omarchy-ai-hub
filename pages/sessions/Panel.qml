@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "../.."
 
@@ -40,7 +41,7 @@ Panel {
   onFilterChanged: root.confirmingDelete = false
 
   readonly property string helper: Qt.resolvedUrl("list-sessions").toString().replace(/^file:\/\//, "")
-  readonly property color fg: root.bar ? root.bar.foreground : Color.foreground
+  readonly property color fg: root.bar ? root.bar.foreground : Commons.Color.foreground
   readonly property color dimmed: Qt.darker(fg, 1.4)
   readonly property color faint: Qt.darker(fg, 1.9)
 
@@ -287,7 +288,7 @@ Panel {
               required property var modelData
               readonly property bool active: root.filter === modelData.agent
               readonly property color brand: String(modelData.color || "") !== ""
-                ? modelData.color : Color.accent
+                ? modelData.color : Commons.Color.accent
 
               readonly property bool hasLogo: String(modelData.iconFile || "") !== ""
               width: pillRow.implicitWidth + Style.space(20)
@@ -295,7 +296,7 @@ Panel {
               radius: height / 2
               color: active ? brand
                 : (pillArea.containsMouse
-                  ? Style.hoverFillFor(root.fg, Color.accent) : "transparent")
+                  ? Style.hoverFillFor(root.fg, Commons.Color.accent) : "transparent")
               border.width: active ? 0 : 1
               border.color: root.faint
 
@@ -319,7 +320,7 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                   text: modelData.name + "  " + modelData.count
                   textFormat: Text.PlainText
-                  color: pillRow.parent.active ? Color.background : root.fg
+                  color: pillRow.parent.active ? Commons.Color.background : root.fg
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
                   font.bold: pillRow.parent.active
@@ -364,14 +365,14 @@ Panel {
               + Style.space(16)
             radius: Style.cornerRadius
             color: (current || rowArea.containsMouse)
-              ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+              ? Style.hoverFillFor(root.fg, Commons.Color.accent) : "transparent"
 
 
             // Agent logo badge in the vendor's brand color.
             Rectangle {
               id: badge
               readonly property color brand: String(row.modelData.color || "") !== ""
-                ? row.modelData.color : Color.accent
+                ? row.modelData.color : Commons.Color.accent
               anchors.left: parent.left
               anchors.leftMargin: Style.space(14)
               anchors.top: parent.top
@@ -488,20 +489,20 @@ Panel {
                   radius: height / 2
                   color: ctlArea.containsMouse
                     ? (modelData.danger && root.confirmingDelete
-                      ? Color.urgent : Color.accent)
+                      ? Commons.Color.urgent : Commons.Color.accent)
                     : "transparent"
                   border.width: 1
                   border.color: modelData.danger && root.confirmingDelete
-                    ? Color.urgent : root.faint
+                    ? Commons.Color.urgent : root.faint
 
                   Text {
                     id: ctlText
                     anchors.centerIn: parent
                     text: parent.modelData.label
                     textFormat: Text.PlainText
-                    color: ctlArea.containsMouse ? Color.background
+                    color: ctlArea.containsMouse ? Commons.Color.background
                       : (parent.modelData.danger && root.confirmingDelete
-                        ? Color.urgent : root.dimmed)
+                        ? Commons.Color.urgent : root.dimmed)
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.caption
                   }
