@@ -5,7 +5,7 @@ Item {
   id: root
   visible: false
   property var settings: ({})
-  property var allProviders: [codex, grok, antigravity, claude, copilot, cursor]
+  property var allProviders: [codex, grok, antigravity, claude, copilot, cursor, muse]
   property var enabledProviders: {
     var result = []
     for (var i = 0; i < allProviders.length; i++) {
@@ -22,6 +22,7 @@ Item {
   Provider { id: claude; providerId: "claude"; settings: root.settings }
   Provider { id: copilot; providerId: "copilot"; settings: root.settings }
   Provider { id: cursor; providerId: "cursor"; settings: root.settings }
+  Provider { id: muse; providerId: "muse"; settings: root.settings }
   Timer { interval: root.anyActive ? 10000 : root.refreshIntervalSec * 1000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.refreshAll(false) }
   function refreshAll(force) {
     for (var i = 0; i < allProviders.length; i++) {

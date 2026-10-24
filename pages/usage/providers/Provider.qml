@@ -50,7 +50,8 @@ Item {
       antigravity: "enableAntigravity",
       claude: "enableClaude",
       copilot: "enableCopilot",
-      cursor: "enableCursor"
+      cursor: "enableCursor",
+      muse: "enableMuse"
     })[providerId]
     if (!key) return true
     var value = settings ? settings[key] : undefined

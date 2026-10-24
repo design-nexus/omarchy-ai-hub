@@ -3,7 +3,7 @@
 
 Every result includes availability, activity, quota buckets, local usage, sessions,
 errors, and presentation metadata. Network quota is not estimated for Claude,
-Copilot, or Cursor.
+Copilot, Cursor, or Muse.
 """
 from __future__ import annotations
 import argparse, datetime as dt, json, os, shutil, subprocess, sys
@@ -17,11 +17,13 @@ META = {
     "claude": ("Claude Code", "#f97316", "claude_usage_scanner.py", "claude", "Anthropic"),
     "copilot": ("Copilot", "#1f6feb", "copilot_usage_scanner.py", "copilot", "GitHub"),
     "cursor": ("Cursor", "#f54e00", "cursor_usage_scanner.py", "agent", "Cursor"),
+    "muse": ("Muse", "#0082FB", "muse_usage_scanner.py", "muse", "Meta"),
 }
-NO_QUOTA_NOTIFY = {"copilot", "cursor"}
+NO_QUOTA_NOTIFY = {"copilot", "cursor", "muse"}
 QUOTA_NOTES = {
     "copilot": "Monthly allowance is not stored locally.",
     "cursor": "Remaining allowance is not available from the local CLI.",
+    "muse": "Muse quota is not estimated.",
 }
 
 def cursor_executable():

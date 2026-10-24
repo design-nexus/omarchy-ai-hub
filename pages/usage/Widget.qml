@@ -286,7 +286,7 @@ BarWidget {
     catch (e) { return fallback }
   }
 
-  readonly property var agentSettingKeys: ["enableCodex", "enableGrok", "enableAntigravity", "enableClaude", "enableCopilot", "enableCursor"]
+  readonly property var agentSettingKeys: ["enableCodex", "enableGrok", "enableAntigravity", "enableClaude", "enableCopilot", "enableCursor", "enableMuse"]
 
   function normalizedSettings(source) {
     var next = cloneObject(source, {}) || {}
@@ -1678,7 +1678,8 @@ BarWidget {
           { key: "enableAntigravity", label: "Antigravity" },
           { key: "enableClaude", label: "Claude Code" },
           { key: "enableCopilot", label: "Copilot" },
-          { key: "enableCursor", label: "Cursor" }
+          { key: "enableCursor", label: "Cursor" },
+          { key: "enableMuse", label: "Muse" }
         ]
         delegate: SettingRow {
           required property var modelData

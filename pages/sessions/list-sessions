@@ -62,6 +62,8 @@ AGENTS = {
                  "icon": chr(0xEB54), "color": "#4796E3"},
     "grok":     {"name": "Grok",        "badge": "GR", "iconFile": "",
                  "icon": chr(0xE904), "iconFont": "omarchy", "color": "#D8D8D8"},
+    "muse":     {"name": "Muse",        "badge": "MU", "iconFile": "",
+                 "icon": "M", "color": "#0082FB"},  # no bundled logo; initial
 }
 
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
@@ -948,6 +950,141 @@ def scan_grok(budget=None):
                "size": file_info.st_size}
 
 
+def muse_home():
+    configured = os.environ.get("MUSE_DATA_HOME")
+    return os.path.expanduser(configured) if configured else HOME + "/.local/share/muse"
+
+
+def muse_model_name(raw):
+    name = clean_inline(raw or "", 80)
+    if not name:
+        return ""
+    if name.lower().startswith("muse-"):
+        parts = name.split("-", 1)[1].replace("-", " ").split()
+        return "Muse " + " ".join(part.upper() if len(part) <= 2 else part.capitalize() for part in parts)
+    return name
+
+
+def muse_intent_text(payload):
+    """First user-visible prompt text from a user_intent.accepted payload."""
+    blocks = payload.get("refill_blocks") if isinstance(payload, dict) else None
+    if not isinstance(blocks, list):
+        return ""
+    parts = []
+    for block in blocks:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            text = block.get("text") if isinstance(block.get("text"), str) else ""
+            if text:
+                parts.append(text)
+    return clean_inline(" ".join(parts), TITLE_MAX)
+
+
+def muse_records(path, budget, max_records):
+    """Yield (payload_type, payload, recorded_at) for direct and framed records."""
+    for line in iter_regular_lines(path, budget, JSONL_HEAD_MAX):
+        try:
+            outer = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(outer, dict):
+            continue
+        if isinstance(outer.get("payload_type"), str):
+            yield outer.get("payload_type"), as_dict(outer.get("payload")), outer.get("recorded_at")
+        children = outer.get("children")
+        if not isinstance(children, list):
+            continue
+        for child in children:
+            raw = child.get("record_json") if isinstance(child, dict) else None
+            if not raw:
+                continue
+            rec = parse_json_dict(raw, budget)
+            if rec is None or not isinstance(rec.get("payload_type"), str):
+                continue
+            yield rec.get("payload_type"), as_dict(rec.get("payload")), rec.get("recorded_at")
+
+
+def muse_first_prompt(path, budget):
+    fallback = ""
+    for payload_type, payload, _when in muse_records(path, budget, 60):
+        if payload_type == "runtime.session":
+            event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+            if event.get("kind") == "started" and isinstance(event.get("prompt"), str):
+                text = clean_inline(event.get("prompt"), TITLE_MAX)
+                if text and usable_text(text):
+                    return text
+                break
+        elif payload_type == "runtime.user_intent.accepted" and not fallback:
+            text = muse_intent_text(payload)
+            if text and usable_text(text):
+                fallback = text
+    return fallback
+
+
+def scan_muse(budget=None):
+    budget = ensure_budget(budget)
+    root = muse_home()
+    con = open_sqlite_readonly(root + "/session-index.db", budget)
+    rows = []
+    if con is not None:
+        try:
+            rows = con.execute(
+                "SELECT session_id, title, prompt_count, model_id, workspace_root,"
+                " created_at_us, updated_at_us, first_user_prompt, session_log_path"
+                " FROM sessions").fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            con.close()
+    for row in rows:
+        fields = list(row) + [""] * 9
+        sid, title, prompt_count, model_id, workspace, created_us, updated_us, first_prompt, log_path = fields[:9]
+        sid = str(sid or "")
+        if not sid:
+            continue
+        try:
+            messages = int(prompt_count or 0)
+        except (TypeError, ValueError):
+            messages = 0
+        path = str(log_path or "")
+        if not path or not os.path.isfile(path):
+            found = bounded_paths([(root + "/sessions/*/*/*/" + sid + "/session.jsonl", False)], budget, cap=2)
+            path = found[0][0] if found else ""
+        # The index can lag a deletion; only list sessions whose log remains.
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            mtime = int(os.lstat(path).st_mtime)
+        except OSError:
+            mtime = 0
+        updated = 0
+        for stamp_us in (updated_us, created_us):
+            try:
+                stamp_us = int(float(stamp_us or 0))
+            except (TypeError, ValueError):
+                continue
+            if stamp_us > 0:
+                updated = max(updated, stamp_us // 1000000)
+        title = clean_title(title or "")
+        if title in ("", "New session"):
+            title = clean_title(first_prompt or "")
+        if not title and messages:
+            title = clean_title(muse_first_prompt(path, budget))
+        if not title:
+            continue
+        model = muse_model_name(model_id)
+        meta = []
+        if messages:
+            meta.append("%d msgs" % messages)
+        if model:
+            meta.append(model)
+        yield {"agent": "muse", "id": sid, "title": title,
+               "dir": str(workspace or HOME), "mtime": max(updated, mtime),
+               "meta": " · ".join(meta), "path": path,
+               "size": 0}
+
+
 SCANNERS = {
     "claude": scan_claude,
     "codex": scan_codex,
@@ -956,12 +1093,13 @@ SCANNERS = {
     "pi": scan_pi,
     "gemini": scan_gemini,
     "grok": scan_grok,
+    "muse": scan_muse,
 }
 
 # Agents whose sessions we know how to delete.
-DELETABLE = {"claude", "codex", "opencode", "grok"}
+DELETABLE = {"claude", "codex", "opencode", "grok", "muse"}
 # Agents whose transcripts peek can render.
-PEEKABLE = {"claude", "codex", "opencode", "grok"}
+PEEKABLE = {"claude", "codex", "opencode", "grok", "muse"}
 
 
 # --- metadata enrichment (only for the sessions that made the cut) ---------
@@ -1148,6 +1286,7 @@ ID_PATTERNS = {
     "copilot":  r"^[A-Za-z0-9._-]{1,120}$",
     "gemini":   r"^[A-Za-z0-9._-]{1,120}$",
     "grok":     r"^[0-9a-fA-F-]{8,64}$",
+    "muse":     r"^[0-9a-fA-F-]{8,64}$",
 }
 
 
@@ -1198,6 +1337,7 @@ def resume(agent, sid):
         "pi":       "pi --session " + shq(sid),
         "gemini":   "gemini --resume " + shq(sid),
         "grok":     "grok --resume " + shq(sid),
+        "muse":     "muse resume " + shq(sid),
     }[agent]
     open_terminal("cd " + shq(cwd) + " && " + inner +
                   "; ec=$?; if [ $ec -ne 0 ]; then echo; "
@@ -1212,6 +1352,8 @@ def session_files(agent, sid, budget=None):
         patterns = [(HOME + "/.codex/sessions/*/*/*/rollout-*" + sid + ".jsonl", False)]
     elif agent == "grok":
         patterns = [(grok_home() + "/sessions/*/" + sid + "/chat_history.jsonl", False)]
+    elif agent == "muse":
+        patterns = [(muse_home() + "/sessions/*/*/*/" + sid + "/session.jsonl", False)]
     else:
         patterns = []
     return [path for path, _info in bounded_paths(patterns, budget, cap=8)]
@@ -1357,6 +1499,25 @@ def render_transcript(agent, sid, budget):
                     text = content_text(content)
                     if usable_text(text):
                         render_block(role, text)
+    elif agent == "muse":
+        for path in session_files(agent, sid, budget)[:1]:
+            for payload_type, payload, _when in muse_records(path, budget, 400):
+                if _blocks_left[0] <= 0 or not budget.active():
+                    break
+                if payload_type == "runtime.session":
+                    event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+                    kind = event.get("kind")
+                    if kind == "started" and isinstance(event.get("prompt"), str):
+                        if usable_text(event["prompt"]):
+                            render_block("user", event["prompt"])
+                    elif kind == "assistant_message_committed":
+                        text = event.get("text") if isinstance(event.get("text"), str) else ""
+                        if usable_text(text):
+                            render_block("assistant", text)
+                elif payload_type == "runtime.user_intent.accepted":
+                    text = muse_intent_text(payload)
+                    if text and usable_text(text):
+                        render_block("user", text)
     else:
         print("No transcript renderer for " + agent)
 
@@ -1394,6 +1555,19 @@ def delete(agent, sid):
         for dir_path, _info in dirs:
             try:
                 shutil.rmtree(dir_path)
+            except OSError:
+                pass
+        return
+    if agent == "muse":
+        # bounded_paths only matches regular files, so resolve the session
+        # directory through its transcript and remove that directory.
+        budget = ScanBudget(seconds=1.0, max_paths=32, max_open_files=8, max_bytes=1024)
+        for path in session_files(agent, sid, budget):
+            parent = os.path.dirname(path)
+            if os.path.basename(parent) != sid:
+                continue
+            try:
+                shutil.rmtree(parent)
             except OSError:
                 pass
         return

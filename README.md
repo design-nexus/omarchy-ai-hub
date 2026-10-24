@@ -4,9 +4,9 @@ One Omarchy bar icon for your AI tooling. Click it for a tabbed panel with five 
 
 | Tab | What it shows |
 | --- | --- |
-| **Usage** | Today's usage, seven-day history, models, quotas and recent sessions for Codex, Grok, Antigravity, Claude Code, GitHub Copilot and Cursor |
+| **Usage** | Today's usage, seven-day history, models, quotas and recent sessions for Codex, Grok, Antigravity, Claude Code, GitHub Copilot, Cursor and Muse |
 | **Live** | Running [herdr](https://github.com/herdrdev/herdr) sessions, the project and agents in each, and which agents are waiting on you |
-| **Sessions** | Past sessions from Claude Code, Codex, opencode, Copilot, Pi, Gemini and Grok, to resume, peek at, open or delete |
+| **Sessions** | Past sessions from Claude Code, Codex, opencode, Copilot, Pi, Gemini, Grok and Muse, to resume, peek at, open or delete |
 | **Skills** | The skills Claude Code, OpenCode and Codex load, what they cost in context, with your own categories and notes |
 | **Local** | Your local model servers, LM Studio and Ollama: start or stop each, load and unload models, copy the server URL, and watch GPU, VRAM, CPU and RAM use |
 
@@ -28,7 +28,7 @@ Hover the icon for a summary of all of it.
 - [Omarchy](https://omarchy.org/)
 - Python 3
 - Each tab needs its own tool, and shows a status message when that tool is missing:
-  - **Usage** and **Sessions:** at least one agent CLI you have used, such as `claude`, `codex`, `copilot` or `grok`
+  - **Usage** and **Sessions:** at least one agent CLI you have used, such as `claude`, `codex`, `copilot`, `grok` or `muse`
   - **Live:** [herdr](https://github.com/herdrdev/herdr)
   - **Local:** [LM Studio](https://lmstudio.ai/) with its `lms` CLI, [Ollama](https://ollama.com/) (`sudo pacman -S ollama`), or both
 
