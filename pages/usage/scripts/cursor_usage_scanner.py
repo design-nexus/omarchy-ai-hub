@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Cursor Agent usage. Remaining allowance is not available from the CLI."""
+"""Cursor Agent usage from local transcripts, with the included allowance from Cursor's dashboard API."""
 from __future__ import annotations
 
 import datetime as dt
@@ -17,7 +17,14 @@ from pathlib import Path
 DATA_HOME = Path(os.environ.get("CURSOR_DATA_HOME", Path.home() / ".cursor"))
 CONFIG_HOME = Path(os.environ.get("CURSOR_CONFIG_HOME", Path.home() / ".config" / "cursor"))
 COLOR = "#f54e00"
-QUOTA_NOTE = "Remaining allowance is not available from the local CLI."
+QUOTA_NOTE = "Cursor did not report an included allowance."
+# "default" is Auto mode, not a model; it is all Cursor keeps when the served model was not saved.
+UNRECORDED = "Not recorded"
+MODEL_NAMES = {"default": UNRECORDED}
+PERIOD_LABELS = {
+    "INCLUDED_USAGE_PERIOD_WEEKLY": "Weekly included usage",
+    "INCLUDED_USAGE_PERIOD_MONTHLY": "Monthly included usage",
+}
 PERIOD_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 PLAN_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -43,6 +50,11 @@ def local_day(timestamp: float) -> dt.date | None:
 
 def clip(value, limit: int = 140) -> str:
     return " ".join(str(value or "").replace("\x00", "").split())[:limit]
+
+
+def model_name(value) -> str:
+    name = clip(value, 80)
+    return MODEL_NAMES.get(name, name)
 
 
 def blank_model(name: str) -> dict:
@@ -124,7 +136,9 @@ def iso_from_epoch(value) -> str:
 
 def quota_from_cursor_period(period: dict, plan_info: dict | None = None) -> tuple[list[dict], str]:
     info = {}
+    merged = False
     if isinstance(plan_info, dict):
+        merged = plan_info.get("isMerged") is True
         nested = plan_info.get("planInfo") or plan_info.get("plan_info") or plan_info
         if isinstance(nested, dict):
             info = nested
@@ -132,8 +146,12 @@ def quota_from_cursor_period(period: dict, plan_info: dict | None = None) -> tup
     usage = period.get("planUsage") or period.get("plan_usage") or {}
     if not isinstance(usage, dict):
         usage = {}
-    reset_time = iso_from_epoch(period.get("billingCycleEnd") or info.get("billingCycleEnd"))
+    # planInfo.billingCycleEnd is the monthly billing date, not the allowance reset.
+    reset_time = iso_from_epoch(info.get("includedUsageResetsAt") or period.get("billingCycleEnd"))
     message = str(period.get("displayMessage") or "")
+    if merged:
+        message = (message + " · Shared with Grok") if message else "Shared with Grok"
+    included_label = PERIOD_LABELS.get(str(info.get("includedUsagePeriod") or ""), "Included usage")
 
     def bucket(bucket_id: str, label: str, percent_used, detail: str = "") -> dict | None:
         try:
@@ -153,7 +171,7 @@ def quota_from_cursor_period(period: dict, plan_info: dict | None = None) -> tup
             "color": COLOR,
         }
 
-    total = bucket("cursor-included", "Included usage", usage.get("totalPercentUsed"), message)
+    total = bucket("cursor-included", included_label, usage.get("totalPercentUsed"), message)
     auto = bucket("cursor-auto", "Auto models", usage.get("autoPercentUsed"), str(period.get("autoModelSelectedDisplayMessage") or ""))
     api = bucket("cursor-api", "API models", usage.get("apiPercentUsed"), str(period.get("namedModelSelectedDisplayMessage") or ""))
     buckets = []
@@ -193,7 +211,7 @@ def cursor_post(url: str, token: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def fetch_cursor_quota(data_home: Path, config_home: Path) -> tuple[list[dict], str, str]:
+def fetch_cursor_quota(data_home: Path, config_home: Path, executable: str = "agent") -> tuple[list[dict], str, str]:
     if os.environ.get("CURSOR_USAGE_SKIP_QUOTA") == "1":
         return [], "", ""
     cache = data_home / "cache" / "quota_usage_cache.json"
@@ -209,13 +227,13 @@ def fetch_cursor_quota(data_home: Path, config_home: Path) -> tuple[list[dict], 
             pass
     token = cursor_access_token(config_home)
     if not token:
-        return [], "", "No Cursor sign-in. Run `agent login`."
+        return [], "", f"No Cursor sign-in. Run `{executable} login`."
     try:
         period = cursor_post(PERIOD_URL, token)
         plan_info = cursor_post(PLAN_URL, token)
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
-            return [], "", "Cursor sign-in expired. Run `agent login`."
+            return [], "", f"Cursor sign-in expired. Run `{executable} login`."
         return [], "", f"Cursor quota returned status {error.code}"
     except (OSError, ValueError, urllib.error.URLError) as exc:
         return [], "", str(exc)
@@ -298,7 +316,7 @@ def read_jsonl(path: Path, session: dict, tools: Counter, models: dict[str, dict
             if not isinstance(obj, dict):
                 continue
             role, message = message_of(obj)
-            model = str(message.get("model") or obj.get("model") or "")
+            model = model_name(message.get("model") or obj.get("model"))
             if model:
                 session["model"] = model
             usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
@@ -344,7 +362,7 @@ def account_prompts(session: dict, models: dict[str, dict], daily_prompts: Count
     count = int(session.get("prompts") or 0)
     if count <= 0:
         return
-    model = session["model"] or "Unknown"
+    model = session["model"] or UNRECORDED
     row = models.setdefault(model, blank_model(model))
     day = session["promptDay"] or today
     key = str(day)
@@ -367,7 +385,7 @@ def read_meta(path: Path, sessions: dict[str, dict]) -> None:
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
         return
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("isSubagent") is True:
         return
     session_id = path.parent.name
     updated = stamp(data.get("updatedAtMs") or data.get("updatedAt"))
@@ -381,12 +399,18 @@ def read_meta(path: Path, sessions: dict[str, dict]) -> None:
         except (OSError, ValueError):
             history = []
         if isinstance(history, list):
+            # Slash commands such as /quit or /usage never reach a model.
+            history = [entry for entry in history if isinstance(entry, str) and not entry.lstrip().startswith("/")]
             prompt_count = len(history)
-            if history and isinstance(history[0], str):
+            if history:
                 preview = clip(history[0])
-    if data.get("hasConversation") is False and prompt_count == 0 and not (path.parent / "store.db").exists():
+    # An empty chat that was /resume'd elsewhere still logs typed prompts; they belong to the resumed chat.
+    if data.get("hasConversation") is False and not (path.parent / "store.db").exists():
         return
     session = sessions.setdefault(session_id, blank_session(session_id))
+    title = clip(data.get("title"))
+    if title and session["title"] == "Cursor session":
+        session["title"] = title
     session["workspace"] = session["workspace"] or str(data.get("cwd") or "")
     session["updated_ts"] = max(session["updated_ts"], updated or created or path.stat().st_mtime)
     if preview and not session["preview"]:
@@ -444,11 +468,46 @@ def read_store(path: Path, session: dict) -> None:
                     if title and session["title"] == "Cursor session":
                         session["title"] = title
                 if model_col:
-                    model = clip(row[cursor], 80)
+                    model = model_name(row[cursor])
                     if model and not session["model"]:
                         session["model"] = model
+        actual = served_model(connection)
+        if actual:
+            session["model"] = actual
     finally:
         connection.close()
+
+
+def served_model(connection: sqlite3.Connection) -> str:
+    """The model that answered most turns. Chat metadata only says "default" for Auto."""
+    counts: Counter = Counter()
+    fallback = ""
+    try:
+        rows = connection.execute("SELECT data FROM blobs")
+    except sqlite3.Error:
+        return ""
+    for (data,) in rows:
+        if not isinstance(data, bytes) or not data.startswith(b"{"):
+            continue
+        try:
+            message = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "system" and not fallback:
+            options = (message.get("providerOptions") or {}).get("cursor") or {}
+            fallback = model_name((options.get("systemPromptFingerprint") or {}).get("model"))
+        elif role == "assistant" and isinstance(message.get("content"), list):
+            names = set()
+            for part in message["content"]:
+                if isinstance(part, dict):
+                    options = (part.get("providerOptions") or {}).get("cursor") or {}
+                    if options.get("modelName"):
+                        names.add(model_name(options["modelName"]))
+            counts.update(names)
+    return counts.most_common(1)[0][0] if counts else fallback
 
 
 def read_tracking(path: Path, sessions: dict[str, dict]) -> None:
@@ -472,7 +531,7 @@ def read_tracking(path: Path, sessions: dict[str, dict]) -> None:
             if title and session["title"] == "Cursor session":
                 session["title"] = clip(title)
             if model and not session["model"]:
-                session["model"] = clip(model, 80)
+                session["model"] = model_name(model)
             updated = stamp(updated_at)
             if updated:
                 session["updated_ts"] = max(session["updated_ts"], updated)
@@ -485,7 +544,7 @@ def read_tracking(path: Path, sessions: dict[str, dict]) -> None:
         for conversation_id, model, timestamp in hashes:
             session = sessions.get(str(conversation_id or ""))
             if session and model and not session["model"]:
-                session["model"] = clip(model, 80)
+                session["model"] = model_name(model)
             if session and timestamp and not session["updated_ts"]:
                 session["updated_ts"] = stamp(timestamp)
     finally:
@@ -570,7 +629,7 @@ def scan(data_home: Path, config_home: Path) -> dict:
     visible.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
     if active and visible:
         visible[0]["isActive"] = True
-    groups, quota_tier, quota_error = fetch_cursor_quota(data_home, config_home)
+    groups, quota_tier, quota_error = fetch_cursor_quota(data_home, config_home, Path(executable).name if executable else "agent")
     tier = quota_tier or plan_tier(executable, data_home)
     model_list = sorted(models.values(), key=lambda item: (item["prompts"], item["steps"], item["name"]), reverse=True)
     days = []
@@ -584,7 +643,7 @@ def scan(data_home: Path, config_home: Path) -> dict:
         })
     current = ""
     for session in visible:
-        if session.get("model"):
+        if session.get("model") and session["model"] != UNRECORDED:
             current = session["model"]
             break
     return {
@@ -604,6 +663,8 @@ def scan(data_home: Path, config_home: Path) -> dict:
         "todayCachedTokens": sum(item["todayCachedTokens"] for item in model_list),
         "todayTokensByModel": {item["name"]: item["todayTokens"] for item in model_list},
         "todayCachedByModel": {item["name"]: item["todayCachedTokens"] for item in model_list},
+        # Agent transcripts usually carry no token usage, so 0 would read as "none used".
+        "tokensTracked": any(item["inputTokens"] or item["outputTokens"] or item["cachedTokens"] for item in model_list),
         "recentDays": days,
         "totalPrompts": sum(daily_prompts.values()),
         "totalSessions": len(visible),

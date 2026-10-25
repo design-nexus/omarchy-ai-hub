@@ -1161,8 +1161,8 @@ BarWidget {
 
       StatBlock { value: root.formatCount(provider ? provider.todayPrompts : 0); label: "prompts" }
       StatBlock { value: root.formatCount(provider ? provider.todaySteps : 0); label: "steps" }
-      StatBlock { value: root.formatCount(provider ? provider.todayTotalTokens : 0); label: "tokens" }
-      StatBlock { value: root.formatCount(provider ? provider.todayCachedTokens : 0); label: "cached" }
+      StatBlock { value: provider && !provider.tokensTracked ? "—" : root.formatCount(provider ? provider.todayTotalTokens : 0); label: "tokens" }
+      StatBlock { value: provider && !provider.tokensTracked ? "—" : root.formatCount(provider ? provider.todayCachedTokens : 0); label: "cached" }
       StatBlock { value: root.formatCount(provider ? provider.totalPrompts : 0); label: "all prompts" }
     }
   }

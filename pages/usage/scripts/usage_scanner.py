@@ -3,7 +3,8 @@
 
 Every result includes availability, activity, quota buckets, local usage, sessions,
 errors, and presentation metadata. Network quota is not estimated for Claude,
-Copilot, Cursor, or Muse.
+Copilot, or Muse. Cursor's quota is read but not alerted on: on a plan merged
+with SuperGrok it is the same pool Grok already alerts for.
 """
 from __future__ import annotations
 import argparse, datetime as dt, json, os, shutil, subprocess, sys
@@ -22,7 +23,7 @@ META = {
 NO_QUOTA_NOTIFY = {"copilot", "cursor", "muse"}
 QUOTA_NOTES = {
     "copilot": "Monthly allowance is not stored locally.",
-    "cursor": "Remaining allowance is not available from the local CLI.",
+    "cursor": "Cursor did not report an included allowance.",
     "muse": "Muse quota is not estimated.",
 }
 
