@@ -18,9 +18,9 @@ DATA_HOME = Path(os.environ.get("CURSOR_DATA_HOME", Path.home() / ".cursor"))
 CONFIG_HOME = Path(os.environ.get("CURSOR_CONFIG_HOME", Path.home() / ".config" / "cursor"))
 COLOR = "#f54e00"
 QUOTA_NOTE = "Cursor did not report an included allowance."
-# "default" is Auto mode, not a model; it is all Cursor keeps when the served model was not saved.
 UNRECORDED = "Not recorded"
-MODEL_NAMES = {"default": UNRECORDED}
+# Cursor records Auto mode as the model "default".
+MODEL_NAMES = {"default": "Auto"}
 PERIOD_LABELS = {
     "INCLUDED_USAGE_PERIOD_WEEKLY": "Weekly included usage",
     "INCLUDED_USAGE_PERIOD_MONTHLY": "Monthly included usage",
@@ -471,43 +471,27 @@ def read_store(path: Path, session: dict) -> None:
                     model = model_name(row[cursor])
                     if model and not session["model"]:
                         session["model"] = model
-        actual = served_model(connection)
-        if actual:
-            session["model"] = actual
+        selected = selected_model(connection)
+        if selected:
+            session["model"] = selected
     finally:
         connection.close()
 
 
-def served_model(connection: sqlite3.Connection) -> str:
-    """The model that answered most turns. Chat metadata only says "default" for Auto."""
-    counts: Counter = Counter()
-    fallback = ""
+def selected_model(connection: sqlite3.Connection) -> str:
+    """The model picked for the chat. Auto stays Auto: Cursor does not bill or report what it routes to."""
     try:
-        rows = connection.execute("SELECT data FROM blobs")
+        rows = connection.execute("SELECT value FROM meta")
     except sqlite3.Error:
         return ""
-    for (data,) in rows:
-        if not isinstance(data, bytes) or not data.startswith(b"{"):
-            continue
+    for (value,) in rows:
         try:
-            message = json.loads(data)
-        except ValueError:
+            meta = json.loads(bytes.fromhex(value) if isinstance(value, str) else value)
+        except (TypeError, ValueError):
             continue
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        if role == "system" and not fallback:
-            options = (message.get("providerOptions") or {}).get("cursor") or {}
-            fallback = model_name((options.get("systemPromptFingerprint") or {}).get("model"))
-        elif role == "assistant" and isinstance(message.get("content"), list):
-            names = set()
-            for part in message["content"]:
-                if isinstance(part, dict):
-                    options = (part.get("providerOptions") or {}).get("cursor") or {}
-                    if options.get("modelName"):
-                        names.add(model_name(options["modelName"]))
-            counts.update(names)
-    return counts.most_common(1)[0][0] if counts else fallback
+        if isinstance(meta, dict) and meta.get("lastUsedModel"):
+            return model_name(meta["lastUsedModel"])
+    return ""
 
 
 def read_tracking(path: Path, sessions: dict[str, dict]) -> None:
@@ -576,6 +560,13 @@ def scan(data_home: Path, config_home: Path) -> dict:
         transcripts.extend(path for path in projects.glob("*/agent-transcripts/*.jsonl"))
         transcripts.extend(path for path in projects.glob("*/agent-transcripts/*/*.txt"))
         transcripts.extend(path for path in projects.glob("*/agent-transcripts/*.txt"))
+    # A chat whose workspace changes is copied in full into the new project folder; read only the newest copy.
+    newest: dict[tuple[str, str], Path] = {}
+    for path in transcripts:
+        key = (transcript_id(path), path.suffix)
+        if key not in newest or path.stat().st_mtime > newest[key].stat().st_mtime:
+            newest[key] = path
+    transcripts = list(newest.values())
     jsonl_ids = {transcript_id(path) for path in transcripts if path.suffix == ".jsonl"}
     for path in transcripts:
         if path.suffix == ".txt" and transcript_id(path) in jsonl_ids:
