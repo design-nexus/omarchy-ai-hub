@@ -5,11 +5,23 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 CACHE_ROOT = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy-ai-hub"
+
+
+def cache_dir(provider: str) -> Path:
+    """This hub's cache folder for one provider, readable only by you. Kept out
+    of the tools' own folders: those are theirs."""
+    path = CACHE_ROOT / provider
+    for folder in (CACHE_ROOT, path):
+        folder.mkdir(mode=0o700, exist_ok=True)
+        if folder.stat().st_mode & 0o077:
+            folder.chmod(0o700)
+    return path
 
 
 def write_private(path: Path, data) -> None:
@@ -126,6 +138,110 @@ def cache_age_iso(path: Path) -> str:
         return dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat()
     except OSError:
         return ""
+
+
+# Small helpers several scanners share, word for word.
+
+_MS_EPOCH_THRESHOLD = 10_000_000_000
+
+
+def date_string(value: dt.date) -> str:
+    return value.strftime("%Y-%m-%d")
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
+
+
+def local_date_from_timestamp(value: Any) -> str:
+    if value is None:
+        return date_string(dt.datetime.now().date())
+    if isinstance(value, (int, float)):
+        try:
+            seconds = normalize_timestamp_seconds(value)
+            return date_string(dt.datetime.fromtimestamp(seconds).date())
+        except Exception:
+            return date_string(dt.datetime.now().date())
+    raw = str(value).strip()
+    if not raw:
+        return date_string(dt.datetime.now().date())
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return date_string(parsed.date())
+    except Exception:
+        pass
+    try:
+        clean = raw.split(".")[0]
+        parsed = dt.datetime.fromisoformat(clean)
+        return date_string(parsed.date())
+    except Exception:
+        return date_string(dt.datetime.now().date())
+
+
+def recent_date_strings() -> list[str]:
+    today = dt.datetime.now().date()
+    return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+
+
+def normalize_timestamp_seconds(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        v = float(value)
+        return v / 1000.0 if v > _MS_EPOCH_THRESHOLD else v
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def sanitize_plain_text(val: Any, max_len: int = 250) -> str:
+    if val is None:
+        return ""
+    text = str(val)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len]
+
+
+def read_configured_model(base_dir: Path | None = None) -> str:
+    if base_dir:
+        config_toml = base_dir / "config.toml"
+        if config_toml.exists():
+            try:
+                for line in config_toml.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("["):
+                        break  # top-level keys only; tables follow
+                    key, sep, val = line.partition("=")
+                    if sep and key.strip() == "model":
+                        val = val.split("#", 1)[0].strip().strip('"').strip("'")
+                        if val:
+                            return sanitize_plain_text(val, 80)
+            except Exception:
+                pass
+    return ""
+
+
+def clip(value, limit: int = 140) -> str:
+    return " ".join(str(value or "").replace("\x00", "").split())[:limit]
+
+
+def local_day(timestamp: float) -> dt.date | None:
+    if not timestamp:
+        return None
+    return dt.datetime.fromtimestamp(timestamp).date()
+
+
+def stamp(value) -> float:
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000 if number > 1e12 else number
+    if isinstance(value, str) and value:
+        try:
+            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0
+    return 0
 
 
 class FetchGate:

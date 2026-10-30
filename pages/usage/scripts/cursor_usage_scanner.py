@@ -14,7 +14,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from common import FetchGate
+from common import FetchGate, cache_dir, clip, local_day, stamp
 
 DATA_HOME = Path(os.environ.get("CURSOR_DATA_HOME", Path.home() / ".cursor"))
 CONFIG_HOME = Path(os.environ.get("CURSOR_CONFIG_HOME", Path.home() / ".config" / "cursor"))
@@ -34,34 +34,12 @@ USER_QUERY = re.compile(r"<user_query>(.*?)(?:</user_query>|$)", re.S)
 WRAPPER = re.compile(r"<([a-z_]+)>.*?</\1>", re.S)
 
 
-def stamp(value) -> float:
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return number / 1000 if number > 1e12 else number
-    if isinstance(value, str) and value:
-        try:
-            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return 0
-    return 0
-
-
 def mtime_of(path: Path) -> float:
     """0 for a file removed while the scan runs."""
     try:
         return path.stat().st_mtime
     except OSError:
         return 0.0
-
-
-def local_day(timestamp: float) -> dt.date | None:
-    if not timestamp:
-        return None
-    return dt.datetime.fromtimestamp(timestamp).date()
-
-
-def clip(value, limit: int = 140) -> str:
-    return " ".join(str(value or "").replace("\x00", "").split())[:limit]
 
 
 def model_name(value) -> str:
@@ -261,7 +239,7 @@ def cursor_post(url: str, token: str) -> dict:
 def fetch_cursor_quota(data_home: Path, config_home: Path, executable: str = "agent", force: bool = False) -> tuple[list[dict], str, str]:
     if os.environ.get("CURSOR_USAGE_SKIP_QUOTA") == "1":
         return [], "", ""
-    cache = data_home / "cache" / "quota_usage_cache.json"
+    cache = cache_dir("cursor") / "quota_usage_cache.json"
     if cache.exists() and not force:
         try:
             age = dt.datetime.now(dt.timezone.utc).timestamp() - cache.stat().st_mtime
@@ -304,7 +282,7 @@ def fetch_cursor_quota(data_home: Path, config_home: Path, executable: str = "ag
 def plan_tier(executable: str, data_home: Path) -> str:
     if os.environ.get("CURSOR_USAGE_SKIP_ABOUT") == "1":
         return ""
-    cache = data_home / "ai-usage-plan-tier.cache"
+    cache = cache_dir("cursor") / "plan-tier.json"
     try:
         cached = json.loads(cache.read_text(encoding="utf-8"))
         age = dt.datetime.now(dt.timezone.utc).timestamp() - float(cached.get("checkedAt") or 0)

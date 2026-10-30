@@ -184,16 +184,6 @@ Column {
     return String(value)
   }
 
-  function formatPct(v) {
-    var n = parseInt(String(v), 10)
-    return isFinite(n) && n >= 0 ? n + "%" : "—"
-  }
-
-  function pctFraction(v) {
-    var n = parseInt(String(v), 10)
-    return isFinite(n) && n >= 0 ? Math.min(1.0, n / 100) : -1
-  }
-
   // On-disk models, marked when already loaded, so the dropdown doubles as a
   // swap-in list.
   readonly property var loadOptions: svc.availableModels.map(function(o) {
@@ -347,8 +337,8 @@ Column {
         fontFamily: root.fontFamily
         iconText: "󰻠"
         label: svc.name + " CPU"
-        value: root.formatPct(root.proc ? root.proc.cpuPct : -1)
-        fraction: root.pctFraction(root.proc ? root.proc.cpuPct : -1)
+        value: Model.formatPct(root.proc ? root.proc.cpuPct : -1)
+        fraction: Model.pctFraction(root.proc ? root.proc.cpuPct : -1)
       }
       ResourceCell {
         foreground: root.foreground
@@ -398,7 +388,6 @@ Column {
           barDim: root.dim
           barUrgent: root.urgentColor
           fontFamily: root.fontFamily
-          loadRemote: root.opened
           hasCursor: root.cursorActive && root.focusSection === "models" && root.modelIndex === index
           onUnload: svc.unloadModel(modelData.identifier)
           onCopy: root.copyRequested(modelData)
@@ -525,7 +514,6 @@ Column {
     property color barDim: Qt.darker(Commons.Color.foreground, 1.55)
     property color barUrgent: Commons.Color.urgent
     property string fontFamily: Style.font.family
-    property bool loadRemote: true
 
     signal unload()
     signal copy()
@@ -556,7 +544,6 @@ Column {
           label: modelData ? modelData.displayName : ""
           foreground: barForeground
           fontFamily: modelCard.fontFamily
-          loadRemote: modelCard.loadRemote
         }
       }
 

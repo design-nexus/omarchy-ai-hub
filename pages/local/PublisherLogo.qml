@@ -4,10 +4,9 @@ import qs.Commons as Commons
 import "Model.js" as Model
 
 // Publisher brand logo for a model card, mirroring LM Studio's model
-// picker: renders the publisher's Simple Icons glyph (CC0) fetched from
-// cdn.simpleicons.org the first time the panel is opened, and falls back
-// to a deterministic colored initial tile while loading, offline, or for
-// publishers without an icon. Only the slug is sent to the CDN.
+// picker: the publisher's Simple Icons glyph (CC0), bundled under
+// assets/publishers, or a deterministic coloured initial tile for publishers
+// without one. Nothing is fetched.
 Item {
   id: root
 
@@ -15,12 +14,8 @@ Item {
   property string label: ""
   property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
-  property bool loadRemote: true
-
   readonly property string slug: Model.publisherLogoSlug(publisher)
-  readonly property url logoSource: loadRemote && slug !== ""
-    ? "https://cdn.simpleicons.org/" + slug + Model.logoColorSuffix(slug)
-    : ""
+  readonly property url logoSource: slug !== "" ? Qt.resolvedUrl("assets/publishers/" + slug + ".svg") : ""
 
   Image {
     id: logo

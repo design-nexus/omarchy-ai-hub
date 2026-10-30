@@ -120,8 +120,9 @@ Panel {
   // widget, and a pin is a thing in one place, not the same thing repeated on
   // every monitor. So the setting names the output it was pinned on and the
   // copies on the other screens read it as "not me".
-  readonly property var barScreen:
-    button.QsWindow.window ? button.QsWindow.window.screen : null
+  // The bar window of the hub hosting this page (this page has no bar button).
+  readonly property var barWindow: bar && bar.pageHost ? bar.pageHost.barWindow : null
+  readonly property var barScreen: barWindow ? barWindow.screen : null
   readonly property string screenName: barScreen ? barScreen.name : ""
   readonly property bool pinned: setting("pinned", false) === true
     && setting("pinScreen", "") === screenName && screenName !== ""
@@ -193,20 +194,9 @@ Panel {
   readonly property int cardMinWidth: Style.space(210)
   readonly property int cardMinHeight: Style.space(120)
 
-  // The glyph, plus the few pixels the badge overhangs its corner by. Without
-  // them the disc spills onto whatever widget sits next in the bar.
-  readonly property int barContentWidth: Style.bar.iconFont + Style.space(4)
-
-  // Panel is a bare Item with no size of its own, so the bar would hand this
-  // widget zero width. Set it from the computed content width, never from a
-  // child that fills this item: that is a loop where nothing decides the size,
-  // the content still paints, and the button quietly stops being clickable.
-  readonly property int barSlot: barContentWidth + Style.space(10)
-
-  readonly property real openPanelIndicatorWidth: barContentWidth
-  readonly property real openPanelIndicatorHeight: barContentWidth
-  implicitWidth: bar && bar.vertical ? (bar ? bar.barSize : Style.bar.sizeHorizontal) : barSlot
-  implicitHeight: bar && bar.vertical ? barSlot : (bar ? bar.barSize : Style.bar.sizeHorizontal)
+  // Never on the bar itself: the hub draws the one bar icon.
+  implicitWidth: 0
+  implicitHeight: 0
 
   // Names come back from herdr and go straight back out as an argument. The
   // script checks them too; this is the near end of the same fence.
@@ -685,34 +675,11 @@ Panel {
     return Qt.darker(root.foreground, 1.7)
   }
 
-  function badgeColor() {
-    if (blockedCount > 0) return root.urgent
-    if (doneCount > 0) return root.finished
-    return root.working
-  }
-
   function subtitleText() {
     var parts = [runningCount + (runningCount === 1 ? " server" : " servers"),
                  agentCount + (agentCount === 1 ? " agent" : " agents")]
     if (doneCount > 0) parts.push(doneCount + " done")
     return parts.join(" \u00B7 ")
-  }
-
-  function titleText() {
-    var s = runningCount === 1 ? " server" : " servers"
-    var a = agentCount === 1 ? " agent" : " agents"
-    return "Herdr (" + runningCount + s + ", " + agentCount + a + ")"
-  }
-
-  // The bar shows a bare number, which says nothing about what it counts. The
-  // tooltip is where that gets spelled out, and where a herd that wants
-  // something says so before the panel is even open.
-  function tooltipText() {
-    var parts = [runningCount + (runningCount === 1 ? " herdr server" : " herdr servers"),
-                 agentCount + (agentCount === 1 ? " agent" : " agents")]
-    if (blockedCount > 0) parts.push(blockedCount + " waiting on you")
-    if (doneCount > 0) parts.push(doneCount + " finished")
-    return parts.join(", ")
   }
 
   function agentKey(sessionName, pane) {
@@ -805,88 +772,6 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    opacity: root.reachable ? 1 : 0.5
-    slotSize: root.barSlot
-    opticalSize: root.barContentWidth
-    tooltipText: root.plain(root.tooltipText())
-
-    iconComponent: Component {
-      Item {
-        Text {
-          id: serverIcon
-          anchors.centerIn: parent
-          text: root.iconServer
-          textFormat: Text.PlainText
-          font.family: root.fontFamily
-          font.pixelSize: Style.bar.iconFont
-          renderType: Text.NativeRendering
-          // barForeground, not the theme's foreground: on a transparent bar
-          // the shell picks the glyph colour off what is behind it, so the
-          // icon turns dark over a light wallpaper the way every other bar
-          // icon does. The theme foreground is only right where the panel
-          // paints its own background.
-          //
-          // Nothing here reacts to the panel being open: the bar draws that
-          // itself, as an accent line on the module's inner edge, for every
-          // widget that has a panel. Tinting the glyph as well says the same
-          // thing twice, in the one colour that means something else.
-          color: root.barForeground
-        }
-
-        // The server count rides the glyph's top-right corner, the way an
-        // unread count rides an app icon, and is sized off the icon font so a
-        // theme that resizes the bar takes it along. The ratios are what the
-        // default 13px icon can carry: a 12px disc around a 9px digit. Three
-        // quarters of the glyph leaves the digit on 6px, which is a coloured
-        // speck rather than a count - unreadable at two digits - and the badge
-        // exists to say how many as much as it says which colour.
-        Rectangle {
-          id: badge
-          anchors.horizontalCenter: serverIcon.horizontalCenter
-          anchors.horizontalCenterOffset: Math.round(Style.bar.iconFont * 0.42)
-          anchors.verticalCenter: serverIcon.verticalCenter
-          anchors.verticalCenterOffset: -Math.round(Style.bar.iconFont * 0.40)
-          visible: root.reachable && root.runningCount > 0 && root.badgeActive
-          height: Math.round(Style.bar.iconFont * 0.95)
-          width: Math.max(height, count.implicitWidth + Math.round(height * 0.45))
-          radius: height / 2
-          color: root.badgeColor()
-          // A rim in the bar's own background separates the badge from the
-          // glyph it sits on, so the corner it covers still reads as a corner
-          // and not as two shapes fused together.
-          border.width: Math.round(Style.bar.iconFont * 0.06)
-          border.color: Commons.Color.bar.background
-
-          Text {
-            id: count
-            anchors.centerIn: parent
-            // Centring the text item leaves the digit riding high: a line box
-            // reserves descender room a digit never uses. Nudge it back down
-            // onto the middle of the disc.
-            anchors.verticalCenterOffset: Math.round(font.pixelSize * 0.1)
-            text: root.runningCount
-            textFormat: Text.PlainText
-            font.family: root.fontFamily
-            font.pixelSize: Math.round((badge.height - 2 * badge.border.width) * 0.88)
-            font.bold: true
-            renderType: Text.NativeRendering
-            color: Commons.Color.background
-          }
-        }
-      }
-    }
-
-    onPressed: function(b) {
-      if (b === Qt.MiddleButton) root.refresh()
-      else root.toggle()
-    }
-  }
-
-
   // ------------------------------------------------------------- dropdown
   //
   // The card in the bar, under the button, open for as long as you are
@@ -897,7 +782,7 @@ Panel {
 
   EmbeddedPanel {
     id: panel
-    anchorItem: button
+    anchorItem: root
     owner: root
     bar: root.bar
     open: root.opened && !root.pinned
@@ -1025,7 +910,7 @@ Panel {
     // layer at Overlay is free to sit on top of the bar, and a panel that
     // opens there on its first day looks like a mistake.
     readonly property real barSize: {
-      var w = button.QsWindow.window
+      var w = root.barWindow
       if (!w || !root.bar) return 0
       var side = root.bar.position
       return (side === "left" || side === "right") ? w.width : w.height

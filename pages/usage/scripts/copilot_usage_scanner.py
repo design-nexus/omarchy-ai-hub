@@ -12,7 +12,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from common import FetchGate
+from common import FetchGate, cache_dir, clip, local_day, stamp
 
 HOME = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot"))
 COLOR = "#1f6feb"
@@ -23,28 +23,6 @@ QUOTA_LABELS = {
     "completions": "Completions",
     "premium_interactions": "Premium requests",
 }
-
-
-def stamp(value) -> float:
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return number / 1000 if number > 1e12 else number
-    if isinstance(value, str) and value:
-        try:
-            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return 0
-    return 0
-
-
-def local_day(timestamp: float) -> dt.date | None:
-    if not timestamp:
-        return None
-    return dt.datetime.fromtimestamp(timestamp).date()
-
-
-def clip(value, limit: int = 140) -> str:
-    return " ".join(str(value or "").replace("\x00", "").split())[:limit]
 
 
 def preview_from(data: dict) -> str:
@@ -178,7 +156,7 @@ def quota_from_copilot_user(payload: dict) -> tuple[list[dict], str]:
 def fetch_copilot_quota(home: Path, force: bool = False) -> tuple[list[dict], str, str]:
     if os.environ.get("COPILOT_USAGE_SKIP_QUOTA") == "1":
         return [], "", ""
-    cache = home / "cache" / "quota_usage_cache.json"
+    cache = cache_dir("copilot") / "quota_usage_cache.json"
     if cache.exists() and not force:
         try:
             if time_age(cache) < 180:

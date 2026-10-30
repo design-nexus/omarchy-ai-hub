@@ -1024,28 +1024,6 @@ Panel {
     return String(s || "").toLowerCase().replace(/[-_\s]+/g, " ")
   }
 
-  // Agent ids as the names this panel calls them by, in one string. The helper
-  // writes claude, opencode, codex, pi and cursor; every other row here has
-  // already been through the same translation, and a list of agents is read
-  // rather than matched on, so it is joined once at the boundary.
-  function toolNames(list) {
-    if (!list || typeof list.length !== "number") return ""
-    var out = []
-    for (var i = 0; i < list.length && i < 8; i++)
-      out.push(root.toolLabel[list[i]] || root.clean(list[i], 24))
-    return out.join(", ")
-  }
-
-  // A command line the panel shows and does not run. Joined for reading only:
-  // what would run it is the tool that owns the skill, in a terminal, and this
-  // panel spawns one program and it is not another agent's CLI.
-  function argvText(argv) {
-    if (!argv || typeof argv.length !== "number") return ""
-    var out = []
-    for (var i = 0; i < argv.length && i < 12; i++) out.push(String(argv[i]))
-    return out.join(" ")
-  }
-
   // The question this panel cannot answer, written out for something that can.
   //
   // A skill directory carries no remote and usually no version, so nothing here
@@ -1620,23 +1598,6 @@ Panel {
     return true
   }
 
-  // Everything the current filter admits, before grouping and before anything is
-  // collapsed. `rows` cannot answer this: a folded group has no rows in it, and
-  // the summary was reporting fourteen skills on a machine with sixteen because
-  // two of its groups were shut. Folding a group hides rows; it does not delete
-  // skills, and the line above the list must not say otherwise. In Tool
-  // grouping it also stops a skill mounted in three agents being counted three
-  // times, which `rows` did by design.
-  readonly property var visibleItems: {
-    var out = []
-    if (!root.loaded) return out
-    var query = root.fold(root.filterText.trim())
-    var src = root.catalogue
-    for (var i = 0; i < src.length; i++)
-      if (root.passes(src[i], "", query)) out.push(src[i])
-    return out
-  }
-
   // Every category that has something in it right now, with how much, in the
   // order the store keeps them. A shelf with nothing on it is not offered:
   // filtering to an empty list is a dead end you can only back out of.
@@ -2203,9 +2164,6 @@ Panel {
   // backend lane owns the store; this only reads it, so a report without
   // order/orderMode (old helper, mid-migration rescan) falls back to today's
   // behaviour: biggest shelf first, ties by stored order.
-  // DND-LANE: shelves list model source = orderedCategories()
-  property string dragHookOrderSource: "orderedCategories"
-
   function categoryOrderMode() {
     var meta = root.report && root.report.categories ? root.report.categories : null
     var m = meta ? String(meta.orderMode || "") : ""
@@ -5071,7 +5029,7 @@ Panel {
           width: parent.width
           textFormat: Text.PlainText
           visible: !root.loaded
-          text: "Reading four skill roots…"
+          text: "Reading skill folders…"
           color: root.readable
           font.family: root.face
           font.pixelSize: Style.font.bodySmall
@@ -5764,7 +5722,7 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
             textFormat: Text.PlainText
             text: {
-              if (!root.loaded) return "Reading four skill roots…"
+              if (!root.loaded) return "Reading skill folders…"
               if (root.filterText !== "") return "Nothing matches “" + root.filterText + "”."
               if (root.attentionOnly) return "Nothing needs attention."
               if (root.report && (root.report.items || []).length > 0 && !root.showBundled)

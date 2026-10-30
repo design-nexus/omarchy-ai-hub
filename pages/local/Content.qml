@@ -107,16 +107,6 @@ Panel {
     if (showOllama) { ollama.refresh(); ollama.refreshAvailableModels() }
   }
 
-  function formatPct(v) {
-    var n = parseInt(String(v), 10)
-    return isFinite(n) && n >= 0 ? n + "%" : "—"
-  }
-
-  function pctFraction(v) {
-    var n = parseInt(String(v), 10)
-    return isFinite(n) && n >= 0 ? Math.min(1.0, n / 100) : -1
-  }
-
   function formatMemPair(used, total) {
     if (total > 0) return Model.formatBytes(used) + " / " + Model.formatBytes(total)
     if (used > 0) return Model.formatBytes(used)
@@ -190,8 +180,8 @@ Panel {
                 fontFamily: root.fontFamily()
                 iconText: "󰓅"
                 label: "GPU"
-                value: root.formatPct(root.resources.gpuUtil)
-                fraction: root.pctFraction(root.resources.gpuUtil)
+                value: Model.formatPct(root.resources.gpuUtil)
+                fraction: Model.pctFraction(root.resources.gpuUtil)
               }
               ResourceCell {
                 foreground: root.foreground()
@@ -206,8 +196,8 @@ Panel {
                 fontFamily: root.fontFamily()
                 iconText: "󰻠"
                 label: "CPU"
-                value: root.formatPct(root.resources.cpuPct)
-                fraction: root.pctFraction(root.resources.cpuPct)
+                value: Model.formatPct(root.resources.cpuPct)
+                fraction: Model.pctFraction(root.resources.cpuPct)
               }
               ResourceCell {
                 foreground: root.foreground()

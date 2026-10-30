@@ -49,12 +49,6 @@ Item {
     return Math.round(Math.min(desired, maxHeight))
   }
 
-  function cappedContentHeight(height) {
-    var desired = Math.max(root.padding * 2, Number(height) || root.padding * 2)
-    var maxHeight = root.availableCardHeight > 0 ? root.availableCardHeight : desired
-    return Math.round(Math.min(desired, maxHeight))
-  }
-
   function close() {
     if (owner && "close" in owner) owner.close()
     else root.open = false

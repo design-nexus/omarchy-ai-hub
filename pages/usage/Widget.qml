@@ -76,25 +76,12 @@ BarWidget {
   }
 
   function close() {
+    if (saveSoon.running) {
+      saveSoon.stop()
+      persistSettings(draftSettings)
+    }
     popupOpen = false
     settingsMode = false
-  }
-
-  function triggerPress(button) {
-    if (button === Qt.RightButton) {
-      openSettings()
-      return
-    }
-    if (button === Qt.MiddleButton) {
-      triggerRefresh(true)
-      return
-    }
-    if (popupOpen) {
-      popupOpen = false
-    } else {
-      popupOpen = true
-      triggerRefresh(false)
-    }
   }
 
   function triggerRefresh(force) {
@@ -276,14 +263,6 @@ BarWidget {
     return normal
   }
 
-  function tooltipText() {
-    if (!provider) return "AI Usage"
-    var count = activeCount(provider)
-    var status = count > 0 ? " (" + count + " " + (count === 1 ? "session" : "sessions") + " " + provider.activeStatus.toLowerCase() + ")" : " (Idle)"
-    var model = provider.currentModel ? " • " + provider.currentModel : ""
-    return provider.providerName + status + "\n" + (provider.todayPrompts || 0) + " prompts today" + model
-  }
-
   // -------------------------------------------------------------- Settings
   function cloneObject(value, fallback) {
     if (value === undefined || value === null) return fallback
@@ -376,10 +355,24 @@ BarWidget {
     }
   }
 
-  width: button.implicitWidth
-  height: button.implicitHeight
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  // Number steppers fire on every step; shell.json is written once they settle.
+  function updateSettingSoon(name, value) {
+    var next = normalizedSettings(root.draftSettings)
+    next[name] = value
+    root.draftSettings = normalizedSettings(next)
+    saveSoon.restart()
+  }
+
+  Timer {
+    id: saveSoon
+    interval: 400
+    onTriggered: root.persistSettings(root.draftSettings)
+  }
+
+  // Never on the bar itself: the hub draws the one bar icon and hosts this
+  // page's panel body.
+  implicitWidth: 0
+  implicitHeight: 0
 
   onPopupOpenChanged: {
     if (popupOpen) {
@@ -424,124 +417,10 @@ BarWidget {
     onTriggered: root.triggerRefresh(false)
   }
 
-  // ------------------------------------------------------------ Bar chip
-  component UsageChip: Item {
-    id: chip
-
-    width: Math.max(root.barSize, iconArea.width + (badge.visible ? badge.width + 3 : 0) + 8)
-    height: root.barSize
-
-    Item {
-      id: iconArea
-      anchors.verticalCenter: parent.verticalCenter
-      x: badge.visible ? 4 : (parent.width - width) / 2
-      width: 18
-      height: 18
-
-      Image {
-        id: barIconImage
-        source: root.iconSource
-        width: 12
-        height: 12
-        sourceSize.width: Math.round(12 * (Screen.devicePixelRatio || 1))
-        sourceSize.height: Math.round(12 * (Screen.devicePixelRatio || 1))
-        fillMode: Image.PreserveAspectFit
-        anchors.centerIn: parent
-        visible: false
-        layer.enabled: true
-      }
-
-      MultiEffect {
-        anchors.fill: barIconImage
-        source: barIconImage
-        colorization: 1.0
-        colorizationColor: root.foreground
-        brightness: 0.3
-      }
-
-      // One cell per agent, in allProviders order, so turning one off does not move the others.
-      Repeater {
-        model: usageMain.allProviders
-        delegate: Rectangle {
-          required property var modelData
-          required property int index
-          readonly property bool live: modelData.agentEnabled && modelData.available && modelData.hasActiveSession
-          width: 3
-          height: 3
-          radius: 1.5
-          visible: live
-          color: modelData.color
-          x: (index % 3) * ((iconArea.width - width) / 2)
-          y: index < 3 ? 0 : iconArea.height - height
-          SequentialAnimation on opacity {
-            running: live && visible
-            loops: Animation.Infinite
-            NumberAnimation { from: .25; to: 1; duration: 600; easing.type: Easing.InOutQuad }
-            NumberAnimation { from: 1; to: .25; duration: 600; easing.type: Easing.InOutQuad }
-          }
-        }
-      }
-    }
-
-    Text {
-      id: badge
-      textFormat: Text.PlainText
-      visible: root.badgeText !== ""
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.left: iconArea.right
-      anchors.leftMargin: 3
-      text: root.badgeText
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: root.fsSmall
-      font.bold: true
-    }
-
-    property var registeredBar: null
-
-    function triggerPress(button) { root.triggerPress(button) }
-
-    function syncClickRegistration() {
-      if (registeredBar && registeredBar.unregisterClickTarget) registeredBar.unregisterClickTarget(chip)
-      registeredBar = root.bar
-      if (registeredBar && registeredBar.registerClickTarget) registeredBar.registerClickTarget(chip)
-    }
-
-    Component.onCompleted: syncClickRegistration()
-    Component.onDestruction: if (registeredBar && registeredBar.unregisterClickTarget) registeredBar.unregisterClickTarget(chip)
-
-    Connections {
-      target: root
-      function onBarChanged() { chip.syncClickRegistration() }
-    }
-
-    MouseArea {
-      anchors.fill: parent
-      acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onEntered: if (root.bar) root.bar.showTooltip(chip, root.tooltipText())
-      onExited: if (root.bar) root.bar.hideTooltip(chip)
-      onClicked: function(mouse) { root.triggerPress(mouse.button) }
-    }
-  }
-
-  Item {
-    id: button
-    anchors.fill: parent
-    implicitWidth: usageChip.width
-    implicitHeight: root.barSize
-
-    UsageChip {
-      id: usageChip
-      anchors.centerIn: parent
-    }
-  }
-
   // ---------------------------------------------------------------- Panel
   EmbeddedPanel {
     id: panel
-    anchorItem: button
+    anchorItem: root
     owner: root
     bar: root.bar
     open: root.popupOpen
@@ -1147,7 +1026,7 @@ BarWidget {
 
     CardEmpty {
       visible: quotaCard.groups.length === 0
-      text: (provider && (provider.quotaNote || provider.quotaError)) || "This agent does not report a remaining allowance."
+      text: (provider && (provider.quotaError || provider.quotaNote)) || "This agent does not report a remaining allowance."
     }
 
     MetaText {
@@ -1691,7 +1570,7 @@ BarWidget {
         foreground: root.foreground
         accent: root.accent
         fontFamily: root.fontFamily
-        onModified: function(value) { root.updateSetting("refreshIntervalSec", value) }
+        onModified: function(value) { root.updateSettingSoon("refreshIntervalSec", value) }
       }
     }
 
@@ -1760,7 +1639,7 @@ BarWidget {
         foreground: root.foreground
         accent: root.accent
         fontFamily: root.fontFamily
-        onModified: function(value) { root.updateSetting("recentSessionsLimit", value) }
+        onModified: function(value) { root.updateSettingSoon("recentSessionsLimit", value) }
       }
     }
 

@@ -32,3 +32,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Icons
+
+The Ollama logo in `pages/local/assets/ollama.svg`, the publisher logos in
+`pages/local/assets/publishers/`, and the Cursor mark in
+`pages/sessions/icons/cursor.svg` are from Simple Icons (https://simpleicons.org),
+released under CC0 1.0. Each is a trademark of its owner.

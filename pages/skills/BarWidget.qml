@@ -136,14 +136,14 @@ BarWidget {
   readonly property var liveAgents: {
     var out = []
     if (!root.summaryPresent || !root.summary.running) return out
-    var order = ["claude", "opencode", "codex"]
+    var order = ["claude", "opencode", "codex", "pi", "cursor"]
     for (var i = 0; i < order.length; i++)
       if (root.summary.running[order[i]] === true) out.push(order[i])
     return out
   }
 
   readonly property string liveNames: {
-    var names = { claude: "Claude Code", opencode: "OpenCode", codex: "Codex" }
+    var names = { claude: "Claude Code", opencode: "OpenCode", codex: "Codex", pi: "Pi", cursor: "Cursor" }
     var out = []
     for (var i = 0; i < root.liveAgents.length; i++) out.push(names[root.liveAgents[i]])
     return out.join(" \u00b7 ")
@@ -199,7 +199,7 @@ BarWidget {
   // Nothing read off another author's disk is ever put here; that stays inside
   // the panel, where every sink is explicitly PlainText.
   readonly property string tooltipText: {
-    if (!root.summaryPresent) return "Agent Skills Manager\nClaude Code · OpenCode · Codex"
+    if (!root.summaryPresent) return "Agent Skills Manager\nClaude Code · OpenCode · Codex · Pi · Cursor"
     var line = String(root.summary.enabled) + " of " + String(root.summary.skills) + " enabled"
     if (!root.tokensHidden)
       line += "  ·  ~" + root.compact(root.liveTokens) + " tokens on every turn"

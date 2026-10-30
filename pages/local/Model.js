@@ -137,9 +137,8 @@ function parseLs(raw) {
 
 // ── Publisher logos ──────────────────────────────────────────────────────
 // `lms` publishers are Hugging Face org/user names. Known brands map to
-// their Simple Icons slug (CC0, served from cdn.simpleicons.org); unknown
-// publishers are tried as a slug directly (many match, e.g. "ollama") and
-// fall back to a colored initial tile at render time when they 404.
+// their Simple Icons slug (CC0), bundled under assets/publishers; every other
+// publisher draws a coloured initial tile.
 
 var PUBLISHER_LOGO_SLUGS = {
     "google": "google",
@@ -161,23 +160,13 @@ var PUBLISHER_LOGO_SLUGS = {
     "huggingface": "huggingface"
 }
 
-// Simple Icons default fill for these slugs is too dark for the panel
-// background; request a lighter hex from the CDN instead.
-var LOGO_COLOR_OVERRIDES = {
-    "anthropic": "D97757"
-}
-
+// The bundled logo for a publisher (assets/publishers/<slug>.svg, Anthropic's
+// saved in its lighter #D97757), or "" for one without, which draws an initial.
+// Only these known names map: fetching logos by publisher name would tell a
+// CDN which models you load.
 function publisherLogoSlug(publisher) {
     var p = String(publisher || "").trim().toLowerCase()
-    if (p === "") return ""
-    if (PUBLISHER_LOGO_SLUGS[p]) return PUBLISHER_LOGO_SLUGS[p]
-    if (/^[a-z0-9][a-z0-9-]*$/.test(p)) return p
-    return ""
-}
-
-function logoColorSuffix(slug) {
-    var color = LOGO_COLOR_OVERRIDES[String(slug || "")]
-    return color ? "/" + color : ""
+    return PUBLISHER_LOGO_SLUGS[p] || ""
 }
 
 // Deterministic hue (0..359) for the fallback initial tile
@@ -201,6 +190,18 @@ function avatarInitial(label, publisher) {
         }
     }
     return "?"
+}
+
+// A percentage for a resource cell: "42%", or a dash when unknown (-1).
+function formatPct(v) {
+    var n = parseInt(String(v), 10)
+    return isFinite(n) && n >= 0 ? n + "%" : "—"
+}
+
+// The same as a 0..1 bar fill, or -1 for no bar.
+function pctFraction(v) {
+    var n = parseInt(String(v), 10)
+    return isFinite(n) && n >= 0 ? Math.min(1.0, n / 100) : -1
 }
 
 /**
@@ -423,7 +424,6 @@ if (typeof module !== "undefined") {
         parseOllamaPs: parseOllamaPs,
         parseResources: parseResources,
         publisherLogoSlug: publisherLogoSlug,
-        logoColorSuffix: logoColorSuffix,
         avatarHue: avatarHue,
         avatarInitial: avatarInitial
     }

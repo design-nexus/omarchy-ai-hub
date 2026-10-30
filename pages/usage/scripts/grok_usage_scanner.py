@@ -5,14 +5,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fcntl
-import glob
 import json
 import os
 import re
-import shutil
-import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -20,92 +15,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from common import FetchGate, LogCache, apply_forecasts, cache_age_iso
+from common import FetchGate, LogCache, apply_forecasts, cache_age_iso, cache_dir, date_string, local_date_from_timestamp, read_configured_model, recent_date_strings, sanitize_plain_text
 from urllib.parse import unquote
 
 
 def default_base_dir() -> Path:
     return Path(os.environ.get("GROK_HOME") or os.path.expanduser("~/.grok"))
-
-
-def expand_path(value: str) -> Path:
-    return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
-
-
-def date_string(value: dt.date) -> str:
-    return value.strftime("%Y-%m-%d")
-
-
-def sanitize_plain_text(val: Any, max_len: int = 250) -> str:
-    if val is None:
-        return ""
-    text = str(val)
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:max_len]
-
-
-def recent_date_strings() -> list[str]:
-    today = dt.datetime.now().date()
-    return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
-
-
-_MS_EPOCH_THRESHOLD = 10_000_000_000
-
-
-def normalize_timestamp_seconds(value: Any) -> float:
-    if value is None:
-        return 0.0
-    try:
-        v = float(value)
-        return v / 1000.0 if v > _MS_EPOCH_THRESHOLD else v
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def local_date_from_timestamp(value: Any) -> str:
-    if value is None:
-        return date_string(dt.datetime.now().date())
-    if isinstance(value, (int, float)):
-        try:
-            seconds = normalize_timestamp_seconds(value)
-            return date_string(dt.datetime.fromtimestamp(seconds).date())
-        except Exception:
-            return date_string(dt.datetime.now().date())
-    raw = str(value).strip()
-    if not raw:
-        return date_string(dt.datetime.now().date())
-    try:
-        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone()
-        return date_string(parsed.date())
-    except Exception:
-        pass
-    try:
-        clean = raw.split(".")[0]
-        parsed = dt.datetime.fromisoformat(clean)
-        return date_string(parsed.date())
-    except Exception:
-        return date_string(dt.datetime.now().date())
-
-
-def read_configured_model(base_dir: Path | None = None) -> str:
-    if base_dir:
-        config_toml = base_dir / "config.toml"
-        if config_toml.exists():
-            try:
-                for line in config_toml.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if line.startswith("["):
-                        break  # top-level keys only; tables follow
-                    key, sep, val = line.partition("=")
-                    if sep and key.strip() == "model":
-                        val = val.split("#", 1)[0].strip().strip('"').strip("'")
-                        if val:
-                            return sanitize_plain_text(val, 80)
-            except Exception:
-                pass
-    return ""
 
 
 def empty_result(base_dir: Path | None = None) -> dict[str, Any]:
@@ -291,7 +206,7 @@ BILLING_ENDPOINT = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 
 
 def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[str, Any]], str, str]:
-    cache_file = base_dir / "cache" / "quota_usage_cache.json"
+    cache_file = cache_dir("grok") / "quota_usage_cache.json"
     cache_file.parent.mkdir(parents=True, exist_ok=True)
 
     if not force and cache_file.exists():
@@ -591,7 +506,7 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         # Served from cache after a failed request: say how old, and why.
         "quotaError": err_str,
-        "quotaUpdatedAt": (cache_age_iso(base_dir / "cache" / "quota_usage_cache.json") if err_str else dt.datetime.now(dt.timezone.utc).isoformat()) if groups else "",
+        "quotaUpdatedAt": (cache_age_iso(cache_dir("grok") / "quota_usage_cache.json") if err_str else dt.datetime.now(dt.timezone.utc).isoformat()) if groups else "",
         "lastFullRefreshMs": round(time.time() * 1000),
         "usageStatusText": "" if has_stats else "No Grok activity found",
         "authHelpText": "" if has_stats else "Run `grok login` to begin.",

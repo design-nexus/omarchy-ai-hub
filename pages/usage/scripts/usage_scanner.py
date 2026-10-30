@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse, datetime as dt, importlib, json, os, shutil, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 META = {
     "codex": ("Codex", "#22c7b8", "codex_usage_scanner", "codex", "OpenAI"),

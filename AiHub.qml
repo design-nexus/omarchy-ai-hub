@@ -46,9 +46,10 @@ BarWidget {
   // What the shell's panel routing reads (summon hotkeys, Tab between bar
   // panels, closing on a bar drag); a widget without it is not a panel.
   readonly property bool opened: popupOpen
-  // The output this bar is on, so script commands reach the focused one.
-  readonly property string screenName: button.QsWindow.window && button.QsWindow.window.screen
-    ? String(button.QsWindow.window.screen.name || "") : ""
+  // The bar window this hub sits in, and its output: script commands go to the
+  // focused one, and Live's pinned card opens on this screen.
+  readonly property var barWindow: button.QsWindow.window
+  readonly property string screenName: barWindow && barWindow.screen ? String(barWindow.screen.name || "") : ""
   property bool popoutSwitchClosing: false
   property bool switching: false
   property var panels: ({})

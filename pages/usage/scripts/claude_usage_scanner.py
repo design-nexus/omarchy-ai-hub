@@ -7,7 +7,6 @@ import datetime as dt
 import json
 import os
 import re
-import shutil
 import subprocess
 import time
 import urllib.error
@@ -16,7 +15,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from common import FetchGate, LogCache, apply_forecasts, cache_age_iso
+from common import FetchGate, LogCache, apply_forecasts, cache_age_iso, cache_dir
 
 HOME = Path.home()
 BASE = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
@@ -165,74 +164,10 @@ def prompt_text(content: Any) -> str | None:
     return text(content) or None
 
 
-def parse_resets_time(s: str) -> str:
-    if not s:
-        return ""
-    cleaned = re.sub(r"\(.*?\)", "", s).strip().rstrip(",")
-    year = dt.datetime.now().year
-    for fmt in ("%b %d, %I%p %Y", "%b %d %I%p %Y", "%b %d, %I:%M%p %Y"):
-        try:
-            parsed = dt.datetime.strptime(f"{cleaned} {year}", fmt)
-            local_tz = dt.datetime.now().astimezone().tzinfo
-            parsed = parsed.replace(tzinfo=local_tz)
-            if parsed < dt.datetime.now(local_tz) - dt.timedelta(days=180):
-                parsed = parsed.replace(year=year + 1)
-            return parsed.isoformat()
-        except ValueError:
-            pass
-    return ""
-
-
-def parse_claude_usage_output(text: str, plan_tier: str = "") -> list[dict[str, Any]]:
-    buckets: list[dict[str, Any]] = []
-    pattern = re.compile(r"^([^:\n]+):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^,\n]+(?:,\s*[^(\n]+)?(?:\s*\([^)]+\))?))?", re.MULTILINE)
-    for match in pattern.finditer(text):
-        raw_label = match.group(1).strip()
-        used = float(match.group(2))
-        rem_pct = max(0.0, 100.0 - used)
-        resets_str = match.group(3).strip() if match.group(3) else ""
-        resets_at = parse_resets_time(resets_str)
-
-        low = raw_label.lower()
-        if "session" in low:
-            b_id = "claude-five-hour"
-            badge = "5h window"
-            b_name = "Current Session Remaining"
-        elif "week" in low and ("all" in low or "model" in low):
-            b_id = "claude-seven-day"
-            badge = "Weekly (7-day)"
-            b_name = "Weekly (all models) Remaining"
-        elif "sonnet" in low:
-            b_id = "claude-seven-day-sonnet"
-            badge = "Weekly (Sonnet)"
-            b_name = "Weekly (Sonnet) Remaining"
-        elif "opus" in low:
-            b_id = "claude-seven-day-opus"
-            badge = "Weekly (Opus)"
-            b_name = "Weekly (Opus) Remaining"
-        else:
-            slug = re.sub(r"[^a-z0-9]+", "-", low).strip("-")
-            b_id = f"claude-{slug}"
-            badge = raw_label
-            b_name = f"{raw_label} Remaining"
-
-        buckets.append({
-            "id": b_id,
-            "name": b_name,
-            "label": badge,
-            "remainingFraction": rem_pct / 100.0,
-            "remainingPercent": round(rem_pct),
-            "usedPercent": round(used),
-            "resetTime": resets_at,
-            "color": COLOR,
-        })
-    return buckets
-
-
 def fetch_claude_quota(base_dir: Path, force: bool = False) -> tuple[list[dict[str, Any]], str, str]:
     if os.environ.get("CLAUDE_USAGE_SKIP_QUOTA") == "1":
         return [], "", ""
-    cache_file = base_dir / "cache" / "quota_usage_cache.json"
+    cache_file = cache_dir("claude") / "quota_usage_cache.json"
     cache_file.parent.mkdir(parents=True, exist_ok=True)
 
     plan_tier = ""
@@ -582,7 +517,7 @@ def scan(base: Path, force: bool = False) -> dict:
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         # Served from cache after a failed request: say how old, and why.
         "quotaError": quota_error,
-        "quotaUpdatedAt": (cache_age_iso(base / "cache" / "quota_usage_cache.json") if quota_error else dt.datetime.now(dt.timezone.utc).isoformat()) if quota_groups else "",
+        "quotaUpdatedAt": (cache_age_iso(cache_dir("claude") / "quota_usage_cache.json") if quota_error else dt.datetime.now(dt.timezone.utc).isoformat()) if quota_groups else "",
         "lastFullRefreshMs": round(time.time() * 1000),
         "usageStatusText": "" if has_stats else "No local activity found",
         "authHelpText": "",

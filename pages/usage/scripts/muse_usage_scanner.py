@@ -5,11 +5,12 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 from collections import Counter
 from pathlib import Path
+
+from common import clip, local_day
 
 DATA_HOME = Path(os.environ.get("MUSE_DATA_HOME", Path.home() / ".local" / "share" / "muse"))
 COLOR = "#0082FB"
@@ -26,16 +27,6 @@ def stamp(value) -> float:
         except ValueError:
             return 0
     return 0
-
-
-def local_day(timestamp: float) -> dt.date | None:
-    if not timestamp:
-        return None
-    return dt.datetime.fromtimestamp(timestamp).date()
-
-
-def clip(value, limit: int = 140) -> str:
-    return " ".join(str(value or "").replace("\x00", "").split())[:limit]
 
 
 def format_muse_model_name(raw: str) -> str:

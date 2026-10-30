@@ -17,19 +17,13 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+
+from common import cache_dir, date_string, expand_path, local_date_from_timestamp, recent_date_strings
 from typing import Any
 
 
 def default_base_dir() -> Path:
     return Path(os.environ.get("ANTIGRAVITY_DATA_DIR") or os.path.expanduser("~/.gemini/antigravity-cli"))
-
-
-def expand_path(value: str) -> Path:
-    return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
-
-
-def date_string(value: dt.date) -> str:
-    return value.strftime("%Y-%m-%d")
 
 
 def sanitize_plain_text(val: Any, max_len: int = 250) -> str:
@@ -44,11 +38,6 @@ def sanitize_plain_text(val: Any, max_len: int = 250) -> str:
     return text[:max_len]
 
 
-def recent_date_strings() -> list[str]:
-    today = dt.datetime.now().date()
-    return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
-
-
 _MS_EPOCH_THRESHOLD = 10_000_000_000  # Timestamps above this are assumed milliseconds
 
 
@@ -61,33 +50,6 @@ def normalize_timestamp_seconds(value: Any) -> float:
         return v / 1000.0 if v > _MS_EPOCH_THRESHOLD else v
     except (TypeError, ValueError):
         return 0.0
-
-
-def local_date_from_timestamp(value: Any) -> str:
-    if value is None:
-        return date_string(dt.datetime.now().date())
-    if isinstance(value, (int, float)):
-        try:
-            seconds = normalize_timestamp_seconds(value)
-            return date_string(dt.datetime.fromtimestamp(seconds).date())
-        except Exception:
-            return date_string(dt.datetime.now().date())
-    raw = str(value).strip()
-    if not raw:
-        return date_string(dt.datetime.now().date())
-    try:
-        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone()
-        return date_string(parsed.date())
-    except Exception:
-        pass
-    try:
-        clean = raw.split(".")[0]
-        parsed = dt.datetime.fromisoformat(clean)
-        return date_string(parsed.date())
-    except Exception:
-        return date_string(dt.datetime.now().date())
 
 
 def read_configured_model(base_dir: Path | None = None) -> str:
@@ -393,7 +355,7 @@ def parse_transcripts(
     recent_dates_set = set(recent_dates) if recent_dates else set()
 
     # Load incremental transcript stats cache
-    cache_file = (base_dir / "cache" / "transcript_stats_cache.json") if base_dir else None
+    cache_file = (cache_dir("antigravity") / "transcript_stats_cache.json") if base_dir else None
     cache: dict[str, Any] = {}
     if cache_file and cache_file.exists():
         try:
@@ -662,7 +624,7 @@ def compute_bucket_forecast(rem_pct: float, burn_rate: float, reset_time_str: st
 def update_quota_snapshots(base_dir: Path, raw_groups: list[dict[str, Any]]) -> dict[str, float]:
     """Record timestamped snapshot of quota fractions and calculate hourly burn rates per bucket."""
     now = time.time()
-    snapshots_path = base_dir / "cache" / "quota_snapshots.json"
+    snapshots_path = cache_dir("antigravity") / "quota_snapshots.json"
     snapshots_path.parent.mkdir(parents=True, exist_ok=True)
 
     current_snapshot = {}
@@ -739,7 +701,7 @@ def update_quota_snapshots(base_dir: Path, raw_groups: list[dict[str, Any]]) -> 
 
 def trigger_bg_quota_refresh(base_dir: Path, agy_bin: str) -> None:
     """Launch detached background process to refresh quota cache without stalling scans."""
-    flag_file = base_dir / "cache" / "quota_refresh.flag"
+    flag_file = cache_dir("antigravity") / "quota_refresh.flag"
     now = time.time()
     if flag_file.exists():
         try:
@@ -765,7 +727,7 @@ def trigger_bg_quota_refresh(base_dir: Path, agy_bin: str) -> None:
 
 def bg_refresh_quota(base_dir: Path) -> None:
     """Worker function executed in background to fetch quota and update snapshots."""
-    cache_path = base_dir / "cache" / "quota_usage_cache.json"
+    cache_path = cache_dir("antigravity") / "quota_usage_cache.json"
     agy_bin = shutil.which("agy") or str(Path.home() / ".local/bin/agy")
     try:
         res = subprocess.run(
@@ -789,7 +751,7 @@ def bg_refresh_quota(base_dir: Path) -> None:
 
 def fetch_agy_usage_quota(base_dir: Path, force: bool = False) -> dict[str, Any]:
     """Fetch real-time quota information via `agy -p /usage --output-format json` with caching."""
-    cache_path = base_dir / "cache" / "quota_usage_cache.json"
+    cache_path = cache_dir("antigravity") / "quota_usage_cache.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     agy_bin = shutil.which("agy") or str(Path.home() / ".local/bin/agy")
 
@@ -987,7 +949,7 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
         return empty_result(base_dir)
 
     # Deduplicate concurrent scans across multi-monitor setups (TTL: 1.5s)
-    scan_cache_path = base_dir / "cache" / "scanner_cache.json"
+    scan_cache_path = cache_dir("antigravity") / "scanner_cache.json"
     if not force and scan_cache_path.exists():
         try:
             mtime = scan_cache_path.stat().st_mtime
@@ -1265,7 +1227,7 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
 
     clean_latest_model = sanitize_plain_text(latest_model, 80)
 
-    quota_cache_path = base_dir / "cache" / "quota_usage_cache.json"
+    quota_cache_path = cache_dir("antigravity") / "quota_usage_cache.json"
     quota_updated_at = ""
     quota_updated_ms = 0
     if quota_cache_path.exists():
