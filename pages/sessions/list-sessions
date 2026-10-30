@@ -64,6 +64,9 @@ AGENTS = {
                  "icon": chr(0xE904), "iconFont": "omarchy", "color": "#D8D8D8"},
     "muse":     {"name": "Muse",        "badge": "MU", "iconFile": "",
                  "icon": "M", "color": "#0082FB"},  # no bundled logo; initial
+    # Cursor's mark is plain black; the same mid grey as the Skills tab.
+    "cursor":   {"name": "Cursor",      "badge": "CU", "iconFile": "icons/cursor.svg",
+                 "icon": chr(0xF0796), "color": "#8A8A8A"},
 }
 
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
@@ -959,6 +962,69 @@ def scan_grok(budget=None):
                "size": file_info.st_size}
 
 
+def cursor_executable():
+    """The Cursor agent CLI: `cursor-agent`, or `agent` when that is Cursor's."""
+    for name in ("cursor-agent", "agent"):
+        path = shutil.which(name)
+        if path and (name == "cursor-agent" or "cursor" in os.path.realpath(path).lower()):
+            return name
+    return "cursor-agent"
+
+
+def cursor_chat_meta(budget):
+    """Working directory and times per chat id, from Cursor's chat folders."""
+    metas = {}
+    for root in (HOME + "/.config/cursor/chats", HOME + "/.cursor/chats"):
+        for path, _info in bounded_paths([(root + "/*/*/meta.json", False)], budget):
+            data = read_json_file(path, budget, max_bytes=64 * 1024)
+            if data is not None and data.get("isSubagent") is not True:
+                metas[os.path.basename(os.path.dirname(path))] = data
+    return metas
+
+
+def cursor_project_dir(path):
+    """The directory a projects/<name>/ folder stands for. The name is the path
+    with / turned into -, which folder names with dashes make ambiguous, so it
+    is rebuilt one existing directory at a time."""
+    name = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+    current, pending = "/", ""
+    for part in name.split("-"):
+        candidate = pending + "-" + part if pending else part
+        if os.path.isdir(os.path.join(current, candidate)):
+            current, pending = os.path.join(current, candidate), ""
+        else:
+            pending = candidate
+    return current if not pending and current != "/" else ""
+
+
+def scan_cursor(budget=None):
+    budget = ensure_budget(budget)
+    metas = cursor_chat_meta(budget)
+    transcripts = bounded_paths([
+        (HOME + "/.cursor/projects/*/agent-transcripts/*/*.jsonl", False),
+    ], budget)
+    for path, file_info in transcripts:
+        sid = os.path.basename(os.path.dirname(path))
+        # <id>/<id>.jsonl is the chat; subagents sit a level deeper.
+        if os.path.basename(path) != sid + ".jsonl":
+            continue
+        title = ""
+        for obj in iter_jsonl_records(path, budget, 20):
+            if obj.get("role") == "user":
+                title = extract_grok_text(as_dict(obj.get("message")).get("content"))
+                if title:
+                    break
+        if not title:
+            continue
+        meta = metas.get(sid, {})
+        cwd = str(meta.get("cwd") or "") or cursor_project_dir(path) or HOME
+        # A chat moved to another workspace is copied whole; collect() keeps
+        # the newest copy of each id.
+        yield {"agent": "cursor", "id": sid, "title": title, "dir": cwd,
+               "mtime": int(file_info.st_mtime), "path": path,
+               "size": file_info.st_size}
+
+
 def muse_home():
     configured = os.environ.get("MUSE_DATA_HOME")
     return os.path.expanduser(configured) if configured else HOME + "/.local/share/muse"
@@ -1103,12 +1169,13 @@ SCANNERS = {
     "gemini": scan_gemini,
     "grok": scan_grok,
     "muse": scan_muse,
+    "cursor": scan_cursor,
 }
 
 # Agents whose sessions we know how to delete.
 DELETABLE = {"claude", "codex", "opencode", "grok", "muse"}
 # Agents whose transcripts peek can render.
-PEEKABLE = {"claude", "codex", "opencode", "grok", "muse"}
+PEEKABLE = {"claude", "codex", "opencode", "grok", "muse", "cursor"}
 
 
 # --- metadata enrichment (only for the sessions that made the cut) ---------
@@ -1129,6 +1196,13 @@ def enrich(s, budget):
             meta.append(model)
         if dur and not truncated:
             meta.append(fmt_dur(dur))
+        meta.append(fmt_size(size))
+    elif s["agent"] == "cursor":
+        counts, _dur, _model, truncated = file_span_and_counts(
+            path, ['"role":"user"', '"role":"assistant"'], budget, size)
+        msgs = counts['"role":"user"'] + counts['"role":"assistant"']
+        if msgs:
+            meta.append("%d%s msgs" % (msgs, "+" if truncated else ""))
         meta.append(fmt_size(size))
     elif s["agent"] == "codex":
         counts, dur, model, truncated = file_span_and_counts(
@@ -1298,6 +1372,7 @@ ID_PATTERNS = {
     "gemini":   r"^[A-Za-z0-9._-]{1,120}$",
     "grok":     r"^[0-9a-fA-F-]{8,64}$",
     "muse":     r"^[0-9a-fA-F-]{8,64}$",
+    "cursor":   r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
 }
 
 
@@ -1354,6 +1429,7 @@ def resume(agent, sid):
         "gemini":   "gemini --resume " + shq(sid),
         "grok":     "grok --resume " + shq(sid),
         "muse":     "muse resume " + shq(sid),
+        "cursor":   cursor_executable() + " --resume " + shq(sid),
     }[agent]
     open_terminal("cd " + shq(cwd) + " && " + inner +
                   "; ec=$?; if [ $ec -ne 0 ]; then echo; "
@@ -1370,6 +1446,8 @@ def session_files(agent, sid, budget=None):
         patterns = [(grok_home() + "/sessions/*/" + sid + "/chat_history.jsonl", False)]
     elif agent == "muse":
         patterns = [(muse_home() + "/sessions/*/*/*/" + sid + "/session.jsonl", False)]
+    elif agent == "cursor":
+        patterns = [(HOME + "/.cursor/projects/*/agent-transcripts/" + sid + "/" + sid + ".jsonl", False)]
     else:
         patterns = []
     return [path for path, _info in bounded_paths(patterns, budget, cap=8)]
@@ -1534,6 +1612,25 @@ def render_transcript(agent, sid, budget):
                     text = muse_intent_text(payload)
                     if text and usable_text(text):
                         render_block("user", text)
+    elif agent == "cursor":
+        for path in session_files(agent, sid, budget)[:1]:
+            for line in iter_regular_lines(path, budget, PEEK_FILE_MAX):
+                if _blocks_left[0] <= 0:
+                    break
+                obj = parse_json_dict(line, budget)
+                if obj is None or obj.get("role") not in ("user", "assistant"):
+                    continue
+                content = as_dict(obj.get("message")).get("content")
+                if obj["role"] == "user":
+                    text = extract_grok_text(content)
+                    if text:
+                        render_block("user", text)
+                    continue
+                # The assistant's words only; tool calls would bury them.
+                for part in content if isinstance(content, list) else []:
+                    if isinstance(part, dict) and part.get("type") == "text" \
+                            and usable_text(part.get("text", "")):
+                        render_block("assistant", part["text"])
     else:
         print("No transcript renderer for " + agent)
 
