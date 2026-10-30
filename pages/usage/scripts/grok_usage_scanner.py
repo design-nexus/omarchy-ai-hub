@@ -19,6 +19,8 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+from common import FetchGate, LogCache
 from urllib.parse import unquote
 
 
@@ -403,6 +405,19 @@ def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[s
         except Exception:
             pass
 
+    def cached_groups(error: str) -> tuple[list[dict[str, Any]], str, str]:
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("groups", []), data.get("tierLabel", "SuperGrok"), error
+        except Exception:
+            return [], "", error
+
+    gate = FetchGate("grok")
+    blocked = gate.blocked(force)
+    if blocked:
+        return cached_groups(blocked)
+
     auth_file = base_dir / "auth.json"
     token, expires_at = access_token(auth_file)
     if not token:
@@ -435,6 +450,7 @@ def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[s
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read()
             payload = json.loads(body.decode("utf-8", errors="replace"))
+        gate.succeeded()
 
         config = payload.get("config") if isinstance(payload, dict) else {}
         tier = str(config.get("subscriptionTier") or payload.get("subscriptionTier") or "SuperGrok")
@@ -498,70 +514,60 @@ def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[s
 
         return groups, tier, ""
     except urllib.error.HTTPError as error:
-        if error.code in (401, 403):
-            return [], "", "Grok sign-in is no longer valid. Run `grok login`."
-        return [], "", f"Grok billing returned status {error.code}"
+        message = ("Grok sign-in is no longer valid. Run `grok login`." if error.code in (401, 403)
+                   else f"Grok billing returned status {error.code}")
+        gate.failed(message)
+        return [], "", message
     except Exception as exc:
-        if cache_file.exists():
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return data.get("groups", []), data.get("tierLabel", "SuperGrok"), ""
-            except Exception:
-                pass
-        return [], "", str(exc)
+        gate.failed(str(exc))
+        return cached_groups(str(exc))
 
 
-def check_and_send_quota_notifications(base_dir: Path, groups: list[dict[str, Any]], threshold_pct: int = 15) -> None:
-    notify_cmd = shutil.which("omarchy-notification-send") or "/usr/share/omarchy/bin/omarchy-notification-send"
-    if not notify_cmd or not Path(notify_cmd).exists():
-        return
+# Bump when read_update_lines or read_history_lines change what they record.
+LOG_CACHE_VERSION = 1
 
-    cooldown_file = base_dir / "cache" / "low_quota_notified.json"
-    cooldown_file.parent.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    notified_state: dict[str, float] = {}
 
-    if cooldown_file.exists():
+def read_update_lines(entry: dict[str, Any], lines: list[bytes], mtime: float) -> None:
+    """Completed turns in one updates.jsonl, as [turns, input, output, cached] by model and day."""
+    for raw in lines:
         try:
-            with open(cooldown_file, "r", encoding="utf-8") as f:
-                notified_state = json.load(f)
-        except Exception:
-            notified_state = {}
+            row = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        params = row.get("params") if isinstance(row, dict) else None
+        update = params.get("update") if isinstance(params, dict) else None
+        if not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed":
+            continue
+        usage = update.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+        day = local_date_from_timestamp(meta.get("agentTimestampMs") or row.get("timestamp"))
+        models = usage.get("modelUsage") if isinstance(usage.get("modelUsage"), dict) else {}
+        m = next(iter(models), None) or "grok-3"
+        m = str(m).rstrip("/").split("/")[-1] or "grok-3"
+        counts = entry["turns"].setdefault(m + "\x1f" + day, [0, 0, 0, 0])
+        counts[0] += 1
+        counts[1] += int(usage.get("inputTokens") or 0)
+        counts[2] += int(usage.get("outputTokens") or 0)
+        counts[3] += int(usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens") or 0)
 
-    dirty = False
-    for g in groups:
-        for b in g.get("buckets", []):
-            rem_pct = b.get("remainingPercent", round((b.get("remainingFraction", 1.0) * 100)))
-            bid = b.get("id") or b.get("name")
-            if not bid:
-                continue
 
-            if rem_pct <= threshold_pct:
-                last_sent = notified_state.get(bid, 0)
-                if now - last_sent > 7200:
-                    b_label = b.get("label") or b.get("name") or "Grok Quota"
-                    msg = f"{b_label} is down to {rem_pct}% remaining."
-                    try:
-                        subprocess.run(
-                            [notify_cmd, "Grok Quota Warning", msg, "--category", "ai"],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        notified_state[bid] = now
-                        dirty = True
-                    except Exception:
-                        pass
-
-    if dirty:
+def read_history_lines(entry: dict[str, Any], lines: list[bytes], mtime: float) -> None:
+    """Tool calls in one chat_history.jsonl, by tool name."""
+    for raw in lines:
         try:
-            with open(cooldown_file, "w", encoding="utf-8") as f:
-                json.dump(notified_state, f)
-        except Exception:
-            pass
+            row = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("type") == "tool_call":
+            name = row.get("tool_name") or row.get("name")
+            if name:
+                key = sanitize_plain_text(name, 50)
+                entry["tools"][key] = entry["tools"].get(key, 0) + 1
 
 
-def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = None) -> dict[str, Any]:
+def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
     res = empty_result(base_dir)
     recent_dates = recent_date_strings()
     today_str = date_string(dt.datetime.now().date())
@@ -597,99 +603,59 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
     total_prompts = 0
     total_steps = 0
 
-    update_files = list(sessions_dir.glob("*/*/updates.jsonl")) if sessions_dir.exists() else []
-    for p in update_files:
-        try:
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except Exception:
-                        continue
+    # Each log is read once and then only what is appended (LogCache): the
+    # turns per model and day from updates.jsonl, tool calls from chat_history.
+    log_cache = LogCache("grok", LOG_CACHE_VERSION)
+    turns: dict[str, list[int]] = {}
+    for p in sorted(sessions_dir.glob("*/*/updates.jsonl")) if sessions_dir.exists() else []:
+        entry = log_cache.update(p, lambda: {"turns": {}}, read_update_lines)
+        for key, counts in (entry or {}).get("turns", {}).items():
+            total = turns.setdefault(key, [0, 0, 0, 0])
+            for i, n in enumerate(counts):
+                total[i] += n
+    for p in sorted(sessions_dir.glob("*/*/chat_history.jsonl")) if sessions_dir.exists() else []:
+        entry = log_cache.update(p, lambda: {"tools": {}}, read_history_lines)
+        tool_counter.update((entry or {}).get("tools", {}))
+    log_cache.prune()
 
-                    params = entry.get("params") if isinstance(entry, dict) else None
-                    update = params.get("update") if isinstance(params, dict) else None
-                    if not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed":
-                        continue
-                    usage = update.get("usage")
-                    if not isinstance(usage, dict):
-                        continue
-
-                    in_tok = int(usage.get("inputTokens") or 0)
-                    out_tok = int(usage.get("outputTokens") or 0)
-                    cached_tok = int(usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens") or 0)
-                    total_tok = in_tok + out_tok
-
-                    meta = entry.get("_meta") if isinstance(entry.get("_meta"), dict) else {}
-                    ts = meta.get("agentTimestampMs") or entry.get("timestamp")
-                    day = local_date_from_timestamp(ts)
-
-                    models = usage.get("modelUsage") if isinstance(usage.get("modelUsage"), dict) else {}
-                    m = next(iter(models), None) or "grok-3"
-                    m = str(m).rstrip("/").split("/")[-1] or "grok-3"
-
-                    total_prompts += 1
-                    total_steps += 1
-
-                    bucket = model_usage.setdefault(m, {
-                        "name": m,
-                        "prompts": 0,
-                        "steps": 0,
-                        "todayPrompts": 0,
-                        "todaySteps": 0,
-                        "weekPrompts": 0,
-                        "weekSteps": 0,
-                        "inputTokens": 0,
-                        "outputTokens": 0,
-                        "cachedTokens": 0,
-                        "color": "#3B82F6",
-                    })
-                    bucket["prompts"] += 1
-                    bucket["steps"] += 1
-                    bucket["inputTokens"] += in_tok
-                    bucket["outputTokens"] += out_tok
-                    bucket["cachedTokens"] += cached_tok
-
-                    if day in recent_days_map:
-                        recent_days_map[day]["messageCount"] += 1
-                        recent_days_map[day]["prompts"] += 1
-                        recent_days_map[day]["steps"] += 1
-                        bucket["weekPrompts"] += 1
-                        bucket["weekSteps"] += 1
-
-                    if day == today_str:
-                        today_prompts += 1
-                        today_steps += 1
-                        today_tokens += total_tok
-                        today_cached += cached_tok
-                        bucket["todayPrompts"] += 1
-                        bucket["todaySteps"] += 1
-                        today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + total_tok
-                        today_cached_by_model[m] = today_cached_by_model.get(m, 0) + cached_tok
-        except Exception:
-            continue
-
-    # Also parse tool calls from chat_history.jsonl
-    for p in sessions_dir.glob("*/*/chat_history.jsonl"):
-        try:
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        if entry.get("type") == "tool_call":
-                            tname = entry.get("tool_name") or entry.get("name")
-                            if tname:
-                                tool_counter[sanitize_plain_text(tname, 50)] += 1
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+    for key, (count, in_tok, out_tok, cached_tok) in turns.items():
+        m, day = key.split("\x1f", 1)
+        total_tok = in_tok + out_tok
+        total_prompts += count
+        total_steps += count
+        bucket = model_usage.setdefault(m, {
+            "name": m,
+            "prompts": 0,
+            "steps": 0,
+            "todayPrompts": 0,
+            "todaySteps": 0,
+            "weekPrompts": 0,
+            "weekSteps": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cachedTokens": 0,
+            "color": "#3B82F6",
+        })
+        bucket["prompts"] += count
+        bucket["steps"] += count
+        bucket["inputTokens"] += in_tok
+        bucket["outputTokens"] += out_tok
+        bucket["cachedTokens"] += cached_tok
+        if day in recent_days_map:
+            recent_days_map[day]["messageCount"] += count
+            recent_days_map[day]["prompts"] += count
+            recent_days_map[day]["steps"] += count
+            bucket["weekPrompts"] += count
+            bucket["weekSteps"] += count
+        if day == today_str:
+            today_prompts += count
+            today_steps += count
+            today_tokens += total_tok
+            today_cached += cached_tok
+            bucket["todayPrompts"] += count
+            bucket["todaySteps"] += count
+            today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + total_tok
+            today_cached_by_model[m] = today_cached_by_model.get(m, 0) + cached_tok
 
     # 3. Fetch billing limits
     groups, tier, err_str = fetch_grok_billing(base_dir, force=force)
@@ -713,8 +679,6 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
                 "resetsAt": b.get("resetTime", ""),
             })
 
-    if notify_threshold is not None and groups:
-        check_and_send_quota_notifications(base_dir, groups, notify_threshold)
 
     model_list = list(model_usage.values())
     model_list.sort(key=lambda m: m["prompts"], reverse=True)
@@ -753,11 +717,15 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
     return res
 
 
+def collect(force: bool = False) -> dict:
+    """This provider's usage, for usage_scanner.py to call in-process."""
+    return scan(default_base_dir(), force=force)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Grok Usage Scanner for Omarchy")
     parser.add_argument("--force", action="store_true", help="Force refresh bypassing caches")
     parser.add_argument("--kill", type=str, metavar="CID", help="Kill session by conversation ID")
-    parser.add_argument("--notify-low-quota", type=int, metavar="PCT", help="Check and notify if quota below PCT")
     args = parser.parse_args()
 
     base_dir = default_base_dir()
@@ -767,7 +735,7 @@ def main() -> None:
         print(json.dumps({"killed": killed, "conversationId": args.kill}))
         return
 
-    data = scan(base_dir, force=args.force, notify_threshold=args.notify_low_quota)
+    data = scan(base_dir, force=args.force)
     print(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
 
 

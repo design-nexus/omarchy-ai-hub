@@ -13,6 +13,9 @@ Item {
   property var settings: ({})
   // Off when the Local tab or the LM Studio section is hidden: no polling.
   property bool polling: true
+  // The Local tab is on screen. Closed, only whether the server is up matters
+  // (the bar ring), so no lms client runs: each one is a Node start.
+  property bool detailed: false
 
   readonly property string kind: "lmstudio"
   readonly property string name: "LM Studio"
@@ -153,7 +156,7 @@ Item {
     if (!installed) {
       if (!whichProcess.running) {
         refreshing = true
-        whichProcess.command = ["which", lmsPath()]
+        whichProcess.command = ["test", "-x", lmsPath()]
         whichProcess.running = true
       }
       return
@@ -199,6 +202,8 @@ Item {
     modelCount = 0
     serverError = ""
   }
+
+  onDetailedChanged: if (detailed) refresh()
 
   onPollingChanged: {
     if (polling) {
@@ -312,28 +317,15 @@ Item {
     pumpLms()
   }
 
-  // Timer: periodic refresh
+  // Model lists change behind our back, so they are re-read every 10 s while
+  // the tab is on screen.
   Timer {
     id: refreshTimer
-    interval: root.refreshIntervalSec * 1000
+    interval: root.detailed ? 10000 : root.refreshIntervalSec * 1000
     repeat: true
     running: root.polling
     triggeredOnStart: true
     onTriggered: root.refresh()
-  }
-
-  // Timer: startup ramp - poll quickly until server shows up
-  Timer {
-    id: startupRamp
-    property int ticks: 0
-    interval: 2000
-    repeat: true
-    running: root.polling
-    onTriggered: {
-      ticks += 1
-      if (root.serverRunning || ticks >= 15) startupRamp.running = false
-      else root.refresh()
-    }
   }
 
   // Timer: delayed refresh after action
@@ -393,8 +385,12 @@ Item {
       var text = String(probeStdout.text || "").trim()
       if (text === "up") {
         root.serverRunning = true
-        root.refreshStatusAndModels()
-        root.refreshAvailableModels()
+        if (root.detailed) {
+          root.refreshStatusAndModels()
+          root.refreshAvailableModels()
+        } else {
+          root.refreshing = false
+        }
       } else {
         root.markServerDown()
       }

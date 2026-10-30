@@ -470,7 +470,7 @@ PanelKeyCatcher {
                   color: panel.agentColor(agentRow.modelData.status)
 
                   SequentialAnimation on opacity {
-                    running: panel.blinking(row.modelData.name, agentRow.modelData)
+                    running: visible && panel.blinking(row.modelData.name, agentRow.modelData)
                     loops: Animation.Infinite
                     alwaysRunToEnd: true
                     NumberAnimation { to: 0.25; duration: 600; easing.type: Easing.InOutQuad }

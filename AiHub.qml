@@ -275,6 +275,23 @@ BarWidget {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  // Blink phase for the dots of busy providers.
+  property bool dotPhase: true
+  readonly property bool anyBusy: !!usagePage && tabShown("usage")
+    && usagePage.allProviders.some(function(p) { return p.agentEnabled && p.hasActiveSession && p.busy })
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.anyBusy && !Style.reduceMotion
+    onTriggered: root.dotPhase = !root.dotPhase
+    onRunningChanged: if (!running) root.dotPhase = true
+  }
+
+  // The pollers behind every page run once in HubServices, whatever the
+  // number of bars; each hub tells it which page it has open.
+  Component.onCompleted: HubServices.addHub(root)
+  Component.onDestruction: HubServices.removeHub(root)
+
   // ------------------------------------------------------------ hosted pages
 
   PageBar { id: usageBar; realBar: root.bar; pageHost: root; pageKey: "usage"; pageEntry: root.usagePage }
@@ -391,7 +408,9 @@ BarWidget {
           brightness: 0.3
         }
 
-        // Provider activity dots, as the usage widget drew them.
+        // Provider activity dots: steady while a session is open, blinking
+        // while that provider is busy. Stepped by a 1 s timer rather than a
+        // fade, so the bar redraws twice a second instead of every frame.
         Repeater {
           model: root.usagePage && root.tabShown("usage") ? root.usagePage.allProviders : []
           delegate: Rectangle {
@@ -403,14 +422,9 @@ BarWidget {
             radius: 1.5
             visible: live
             color: modelData.color
+            opacity: modelData.busy && !root.dotPhase ? 0.3 : 1
             x: (index % 3) * ((iconArea.width - width) / 2)
             y: index < 3 ? 0 : iconArea.height - height
-            SequentialAnimation on opacity {
-              running: live
-              loops: Animation.Infinite
-              NumberAnimation { from: .25; to: 1; duration: 600; easing.type: Easing.InOutQuad }
-              NumberAnimation { from: 1; to: .25; duration: 600; easing.type: Easing.InOutQuad }
-            }
           }
         }
       }

@@ -377,6 +377,11 @@ def scan(data_home: Path) -> dict:
     }
 
 
+def collect(force: bool = False) -> dict:
+    """This provider's usage, for usage_scanner.py to call in-process."""
+    return scan(DATA_HOME)
+
+
 def main() -> None:
     print(json.dumps(scan(DATA_HOME), separators=(",", ":"), ensure_ascii=False))
 

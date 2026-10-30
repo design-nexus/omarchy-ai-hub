@@ -387,7 +387,9 @@ Panel {
   }
 
   // ── Resources ───────────────────────────────────────────────────────
-  // Sampled every 2 s (btop's default) while the tab is open.
+  // Sampled every 2 s (btop's default) while the tab is open and a server
+  // runs; with none running there is nothing of theirs to show, and
+  // nvidia-smi would only keep a sleeping GPU awake.
 
   Process {
     id: resProcess
@@ -403,28 +405,17 @@ Panel {
   Timer {
     interval: 2000
     repeat: true
-    running: root.opened && root.sections.length > 0
+    running: root.opened && root.anyRunning
     triggeredOnStart: true
     onTriggered: if (!resProcess.running) resProcess.running = true
   }
 
-  // Model lists change behind our back (Ollama unloads idle models), so
-  // re-read them while the tab is on screen.
-  Timer {
-    interval: 10000
-    repeat: true
-    running: root.opened
-    onTriggered: {
-      if (root.showLmStudio) root.lmstudio.refresh()
-      if (root.showOllama) root.ollama.refresh()
-    }
-  }
-
+  // The services refresh themselves when the tab comes on screen.
   onOpenedChanged: if (opened) {
     for (var i = 0; i < sections.length; i++) sections[i].clearCursor()
     activeSection = null
     panelFlick.contentY = 0
-    refreshAll()
+    _prevResources = null
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 }

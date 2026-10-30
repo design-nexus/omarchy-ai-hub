@@ -92,19 +92,19 @@ Panel {
   readonly property color workingForeground: themeColor("herdr.working", root.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  property var sessions: []
-  property int runningCount: 0
-  property int agentCount: 0
-  property int blockedCount: 0
-  property int doneCount: 0
-  property int workingCount: 0
+  // The herd itself is polled once for every bar, in HubServices.
+  readonly property var herdr: HubServices.herdr
+  readonly property var sessions: herdr.sessions
+  readonly property int runningCount: herdr.runningCount
+  readonly property int agentCount: herdr.agentCount
+  readonly property int blockedCount: herdr.blockedCount
+  readonly property int doneCount: herdr.doneCount
+  readonly property int workingCount: herdr.workingCount
   // The three states that turn into each other without you touching anything.
-  // They decide the badge's colour, and they decide how often it is worth
-  // asking - an idle herd cannot change until you change it.
-  readonly property bool badgeActive:
-    blockedCount > 0 || doneCount > 0 || workingCount > 0
-  property bool reachable: true
-  property string errorText: ""
+  // They decide the badge's colour.
+  readonly property bool badgeActive: herdr.badgeActive
+  readonly property bool reachable: herdr.reachable
+  readonly property string errorText: herdr.errorText
   // Session the script is currently acting on, so its row can dim.
   property string pendingName: ""
   // The session the kill dialog is asking about, held while it is open.
@@ -226,11 +226,7 @@ Panel {
     return String(s || "").replace(/[<>]/g, "")
   }
 
-  function refresh() {
-    if (listProc.running) return
-    listProc.command = [root.script, "list"]
-    listProc.running = true
-  }
+  function refresh() { herdr.refresh() }
 
   function run(action, name, extra) {
     if (!validName(name) || actionProc.running) return
@@ -744,30 +740,22 @@ Panel {
     return root.agentKey(sessionName, agent.pane) === root.attentionKey
   }
 
-  function applyPayload(text) {
-    try {
-      var data = JSON.parse(text)
-      reachable = data.ok === true
-      errorText = data.error || ""
-      if (!reachable) return
-      sessions = data.sessions || []
-      updateAttention(sessions)
-      if (opened && !cursorPlaced) {
-        cursor = bestRow()
-        cursorPlaced = true
-        var row = rowAt(cursor)
-        if (row) showRow(row.sessionIndex)
-      }
-      runningCount = data.running || 0
-      agentCount = data.agents || 0
-      blockedCount = data.blocked || 0
-      doneCount = data.done || 0
-      workingCount = data.working || 0
-      if (cursor > navRows.length - 1) cursor = navRows.length - 1
-    } catch (e) {
-      reachable = false
-      errorText = "unexpected output from herdr-sessions"
+  // Each fresh herd from the shared poll: work out who just started asking,
+  // and put the cursor on the best row once per opening.
+  function sessionsArrived() {
+    updateAttention(sessions)
+    if (opened && !cursorPlaced) {
+      cursor = bestRow()
+      cursorPlaced = true
+      var row = rowAt(cursor)
+      if (row) showRow(row.sessionIndex)
     }
+    if (cursor > navRows.length - 1) cursor = navRows.length - 1
+  }
+
+  Connections {
+    target: root.herdr
+    function onSessionsChanged() { root.sessionsArrived() }
   }
 
   onOpenedChanged: {
@@ -786,13 +774,6 @@ Panel {
   }
 
   Process {
-    id: listProc
-    stdout: StdioCollector {
-      onStreamFinished: root.applyPayload(text)
-    }
-  }
-
-  Process {
     id: actionProc
     onExited: function(exitCode) {
       root.pendingName = ""
@@ -806,20 +787,6 @@ Panel {
   Timer {
     id: settleTimer
     interval: 400
-    onTriggered: root.refresh()
-  }
-
-  // Polled rather than subscribed: herdr has an event socket, but one per
-  // server, and the count in the bar is the sort of thing that can be a few
-  // seconds old. Faster while the panel is open, because the agent states in
-  // it are what you came to read, and faster while anything is live, because
-  // that is the only time the badge colour can go stale on its own. Idle costs
-  // one poll every twenty seconds and catches the moment you start something.
-  Timer {
-    interval: root.opened ? 3000 : (root.badgeActive ? 5000 : 20000)
-    running: true
-    repeat: true
-    triggeredOnStart: true
     onTriggered: root.refresh()
   }
 

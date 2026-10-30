@@ -12,6 +12,9 @@ Item {
   property var settings: ({})
   // Off when the Local tab or the Ollama section is hidden: no polling.
   property bool polling: true
+  // The Local tab is on screen. Closed, only whether the server is up matters
+  // (the bar ring), so the loaded and on-disk models are not fetched.
+  property bool detailed: false
 
   readonly property string kind: "ollama"
   readonly property string name: "Ollama"
@@ -89,20 +92,35 @@ Item {
       whichProcess.command = ["bash", "-c", "command -v ollama"]
       whichProcess.running = true
     }
-    if (probeProcess.running) return
+    if (probeRequest) return
     refreshing = true
-    probeProcess.command = ctlCommand(["probe"])
-    probeProcess.running = true
+    var xhr = new XMLHttpRequest()
+    probeRequest = xhr
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== XMLHttpRequest.DONE || root.probeRequest !== xhr) return
+      root.probeRequest = null
+      probeTimeout.stop()
+      var text = String(xhr.responseText || "").trim()
+      if (xhr.status === 200 && text.indexOf("{") === 0) root.markServerUp(text)
+      else root.markServerDown()
+      root.refreshing = false
+    }
+    xhr.open("GET", hostUrl + "/api/version")
+    xhr.send()
+    probeTimeout.restart()
   }
 
+  // The version request in flight; a GET, so no process per probe.
+  property var probeRequest: null
+
   function refreshModels() {
-    if (!polling || !serverRunning || psProcess.running) return
+    if (!polling || !detailed || !serverRunning || psProcess.running) return
     psProcess.command = ctlCommand(["ps"])
     psProcess.running = true
   }
 
   function refreshAvailableModels() {
-    if (!polling || !serverRunning || tagsProcess.running) return
+    if (!polling || !detailed || !serverRunning || tagsProcess.running) return
     tagsProcess.command = ctlCommand(["tags"])
     tagsProcess.running = true
   }
@@ -207,6 +225,8 @@ Item {
     actionWatchdog.restart()
   }
 
+  onDetailedChanged: if (detailed) { refresh(); refreshAvailableModels() }
+
   onPollingChanged: {
     if (polling) {
       refresh()
@@ -222,9 +242,11 @@ Item {
     actionStatus = ""
   }
 
+  // Ollama unloads idle models on its own, so the list is re-read every 10 s
+  // while the tab is on screen.
   Timer {
     id: refreshTimer
-    interval: root.refreshIntervalSec * 1000
+    interval: root.detailed ? 10000 : root.refreshIntervalSec * 1000
     repeat: true
     running: root.polling
     triggeredOnStart: true
@@ -282,13 +304,15 @@ Item {
     }
   }
 
-  Process {
-    id: probeProcess
-    stdout: StdioCollector { id: probeStdout; waitForEnd: true }
-    onExited: function(exitCode) {
-      var text = String(probeStdout.text || "").trim()
-      if (text.indexOf("{") === 0) root.markServerUp(text)
-      else root.markServerDown()
+  Timer {
+    id: probeTimeout
+    interval: 2000
+    onTriggered: {
+      var xhr = root.probeRequest
+      if (!xhr) return
+      root.probeRequest = null
+      xhr.abort()
+      root.markServerDown()
       root.refreshing = false
     }
   }

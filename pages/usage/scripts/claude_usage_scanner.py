@@ -16,6 +16,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from common import FetchGate, LogCache
+
 HOME = Path.home()
 BASE = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 COLOR = "#D97757"
@@ -109,8 +111,13 @@ def blank_model(name: str) -> dict:
     }
 
 
+# Claude processes that are not a session: the browser extension's native
+# messaging host, one-shot prints, and MCP servers.
+NOT_A_SESSION = {"--chrome-native-host", "-p", "--print", "mcp"}
+
+
 def claude_active_cwds() -> list[str]:
-    """Working directories of running claude processes (zombies excluded)."""
+    """Working directories of running interactive claude sessions (zombies and helpers excluded)."""
     try:
         out = subprocess.run(["pgrep", "-x", "claude"], capture_output=True, text=True, timeout=1).stdout
     except (OSError, subprocess.TimeoutExpired):
@@ -119,11 +126,14 @@ def claude_active_cwds() -> list[str]:
     for pid in out.split():
         proc = Path("/proc") / pid
         try:
+            argv = (proc / "cmdline").read_bytes().decode("utf-8", errors="replace").split("\0")
+            if NOT_A_SESSION.intersection(argv[1:]):
+                continue
             if re.search(r"^State:\s*Z", (proc / "status").read_text(errors="replace"), re.M):
                 continue
             cwds.append(os.readlink(proc / "cwd"))
         except OSError:
-            cwds.append("")
+            continue
     return cwds
 
 
@@ -249,55 +259,6 @@ def update_quota_snapshots(base_dir: Path, groups: list[dict[str, Any]]) -> dict
     return burn_rates
 
 
-def check_and_send_quota_notifications(base_dir: Path, groups: list[dict[str, Any]], threshold_pct: int = 15) -> None:
-    notify_cmd = shutil.which("omarchy-notification-send") or "/usr/share/omarchy/bin/omarchy-notification-send"
-    if not notify_cmd or not Path(notify_cmd).exists():
-        return
-
-    cooldown_file = base_dir / "cache" / "low_quota_notified.json"
-    cooldown_file.parent.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    notified_state: dict[str, float] = {}
-
-    if cooldown_file.exists():
-        try:
-            with open(cooldown_file, "r", encoding="utf-8") as f:
-                notified_state = json.load(f)
-        except Exception:
-            notified_state = {}
-
-    dirty = False
-    for g in groups:
-        for b in g.get("buckets", []):
-            rem_pct = b.get("remainingPercent", round((b.get("remainingFraction", 1.0) * 100)))
-            bid = b.get("id") or b.get("name")
-            if not bid:
-                continue
-
-            if rem_pct <= threshold_pct:
-                last_sent = notified_state.get(bid, 0)
-                if now - last_sent > 7200:
-                    b_label = b.get("label") or b.get("name") or "Claude Quota"
-                    msg = f"{b_label} is down to {rem_pct}% remaining."
-                    try:
-                        subprocess.run(
-                            [notify_cmd, "Claude Quota Warning", msg, "--category", "ai"],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        notified_state[bid] = now
-                        dirty = True
-                    except Exception:
-                        pass
-
-    if dirty:
-        try:
-            with open(cooldown_file, "w", encoding="utf-8") as f:
-                json.dump(notified_state, f)
-        except Exception:
-            pass
-
-
 def parse_resets_time(s: str) -> str:
     if not s:
         return ""
@@ -389,13 +350,20 @@ def fetch_claude_quota(base_dir: Path, force: bool = False) -> tuple[list[dict[s
             pass
 
     buckets: list[dict[str, Any]] = []
+    gate = FetchGate("claude")
+    error = gate.blocked(force)
 
     # 1. Read quota via direct OAuth API (does not launch `claude -p` which spawns phantom sessions)
-    if creds_file.exists():
+    if creds_file.exists() and not error:
         try:
             creds = json.loads(creds_file.read_text(encoding="utf-8")).get("claudeAiOauth", {})
             token = creds.get("accessToken")
-            if token:
+            expires_ms = float(creds.get("expiresAt") or 0)
+            if token and expires_ms and expires_ms / 1000 < time.time():
+                # Claude Code renews it on its next start; asking with it only fails.
+                error = "Claude sign-in expired. Start `claude` to renew it."
+                gate.failed(error)
+            elif token:
                 req = urllib.request.Request(
                     "https://api.anthropic.com/api/oauth/usage",
                     headers={
@@ -427,8 +395,10 @@ def fetch_claude_quota(base_dir: Path, force: bool = False) -> tuple[list[dict[s
                             "resetTime": win.get("resets_at", ""),
                             "color": COLOR,
                         })
-        except Exception:
-            pass
+                gate.succeeded()
+        except Exception as exc:
+            error = f"Claude quota request failed: {exc}"
+            gate.failed(error)
 
     if buckets:
         groups = [{
@@ -448,14 +418,88 @@ def fetch_claude_quota(base_dir: Path, force: bool = False) -> tuple[list[dict[s
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-                return cached.get("groups", []), cached.get("planTier", plan_tier), ""
+                return cached.get("groups", []), cached.get("planTier", plan_tier), error or ""
         except Exception:
             pass
 
-    return [], plan_tier, ""
+    return [], plan_tier, error or ""
 
 
-def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -> dict:
+# Bump when read_transcript_lines changes what it records, so caches are rebuilt.
+TRANSCRIPT_CACHE_VERSION = 2
+
+
+def blank_transcript() -> dict:
+    """What one transcript contributes, accumulated line by line (see LogCache).
+
+    msgs: one record per API message, [model, day, step, input, output,
+    cache_read, cache_write]. One message is written as several rows (one per
+    content block), each repeating its usage, so only its first row counts.
+    loose: the same counts for rows that carry no message id, by model and day.
+    promptLog: prompts already credited to a model, by row uuid; pending:
+    prompts still waiting for the assistant turn that names their model.
+    """
+    return {"model": "", "cwd": "", "preview": "", "prompts": 0, "tokens": 0,
+            "pending": [], "promptLog": {}, "msgs": {}, "loose": {}, "tools": {}}
+
+
+def read_transcript_lines(entry: dict, lines: list[bytes], mtime: float, is_subagent: bool, stem: str) -> None:
+    for raw in lines:
+        try:
+            # Tool output can hold invalid UTF-8; the row still counts.
+            row = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        role = message.get("role") or row.get("role")
+        day = str(local_day(stamp(row.get("timestamp")), mtime))
+        if not entry["cwd"] and row.get("cwd"):
+            entry["cwd"] = str(row["cwd"])
+        if role == "user" and not row.get("isMeta") and not is_subagent:
+            user_text = prompt_text(message.get("content", row.get("content", "")))
+            if user_text is not None:
+                entry["prompts"] += 1
+                entry["pending"].append([str(row.get("uuid") or f"{stem}:{entry['prompts']}"), day])
+                if not entry["preview"]:
+                    entry["preview"] = user_text
+        seen = message.get("model") or row.get("model") or ""
+        if seen and seen != "<synthetic>":
+            clean = format_claude_model_name(str(seen))
+            if clean:
+                entry["model"] = clean
+        model = entry["model"]
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = text(block.get("name"), 60)
+                    entry["tools"][name] = entry["tools"].get(name, 0) + 1
+        step = 1 if role == "assistant" and model and seen != "<synthetic>" else 0
+        if step:
+            for uid, prompt_day in entry["pending"]:
+                entry["promptLog"][uid] = [model, prompt_day]
+            entry["pending"] = []
+        key = str(message.get("id") or "") + "\x1f" + str(row.get("requestId") or "")
+        keyed = key != "\x1f"
+        if keyed and key in entry["msgs"]:
+            continue
+        usage = message.get("usage") or row.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
+        counts = [step, int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
+                  int(usage.get("cache_read_input_tokens") or 0), int(usage.get("cache_creation_input_tokens") or 0)]
+        entry["tokens"] += counts[1] + counts[2] + counts[4]
+        if keyed:
+            entry["msgs"][key] = [model, day] + counts
+        elif model and any(counts):
+            loose = entry["loose"].setdefault(model + "\x1f" + day, [0, 0, 0, 0, 0])
+            for i, n in enumerate(counts):
+                loose[i] += n
+
+
+def scan(base: Path, force: bool = False) -> dict:
     today = dt.date.today()
     week = {str(today - dt.timedelta(days=i)) for i in range(7)}
     daily_prompts: Counter = Counter()
@@ -477,109 +521,85 @@ def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -
         if key in week:
             row["weekPrompts"] += 1
 
-    def add_step(model: str, day: dt.date) -> None:
+    def add_step(model: str, day: dt.date, count: int = 1) -> None:
         row = bucket(model)
         key = str(day)
-        row["steps"] += 1
-        daily_steps[key] += 1
+        row["steps"] += count
+        daily_steps[key] += count
         if day == today:
-            row["todaySteps"] += 1
+            row["todaySteps"] += count
         if key in week:
-            row["weekSteps"] += 1
+            row["weekSteps"] += count
 
-    # One API message is written as several transcript rows (one per content
-    # block), each repeating the same usage; count every message once.
-    seen_messages: set[tuple[str, str]] = set()
     today_tokens: Counter = Counter()
     today_cached: Counter = Counter()
 
+    def add_usage(model: str, day_text: str, step: int, input_tokens: int, output_tokens: int,
+                  cache_read: int, cache_write: int) -> None:
+        if not model:
+            return
+        day = dt.date.fromisoformat(day_text)
+        if step:
+            add_step(model, day, step)
+        # Headline tokens exclude cache reads (the context re-read on every
+        # turn); those are reported separately.
+        fresh = input_tokens + output_tokens + cache_write
+        if day == today:
+            today_tokens[model] += fresh
+            today_cached[model] += cache_read
+        if fresh or cache_read:
+            target = bucket(model)
+            target["inputTokens"] += input_tokens
+            target["outputTokens"] += output_tokens
+            target["cachedTokens"] += cache_read + cache_write
+
+    # A resumed or forked session copies earlier messages into a new
+    # transcript; each message and prompt counts once across all of them.
+    seen_messages: set[str] = set()
+    seen_prompts: set[str] = set()
+    log_cache = LogCache("claude", TRANSCRIPT_CACHE_VERSION)
     projects = base / "projects"
-    paths = projects.glob("**/*.jsonl") if projects.exists() else []
+    paths = sorted(projects.glob("**/*.jsonl")) if projects.exists() else []
     for path in paths:
-        prompts = 0
-        tokens = 0
-        updated = path.stat().st_mtime
-        model = ""
-        preview = ""
-        cwd = ""
         # Subagent transcripts add steps and tokens but no user prompts, and
         # are not resumable sessions.
         is_subagent = path.parent.name == "subagents"
-        pending: list[dt.date] = []
-        try:
-            for line in path.open(encoding="utf-8", errors="replace"):
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                message = row.get("message") or {}
-                role = message.get("role") or row.get("role")
-                day = local_day(stamp(row.get("timestamp")), updated)
-                is_meta = bool(row.get("isMeta"))
-                if not cwd and row.get("cwd"):
-                    cwd = str(row["cwd"])
-                user_text = prompt_text(message.get("content", row.get("content", ""))) if role == "user" and not is_meta and not is_subagent else None
-                if user_text is not None:
-                    prompts += 1
-                    pending.append(day)
-                    if not preview:
-                        preview = user_text
-                seen = message.get("model") or row.get("model") or ""
-                if seen and seen != "<synthetic>":
-                    clean = format_claude_model_name(str(seen))
-                    if clean:
-                        model = clean
-                msg_key = (str(message.get("id") or ""), str(row.get("requestId") or ""))
-                duplicate = bool(msg_key[0] or msg_key[1]) and msg_key in seen_messages
-                if role == "assistant" and model and seen != "<synthetic>":
-                    if not duplicate:
-                        add_step(model, day)
-                    while pending:
-                        add_prompt(model, pending.pop(0))
-                usage = {} if duplicate else (message.get("usage") or row.get("usage") or {})
-                if msg_key[0] or msg_key[1]:
-                    seen_messages.add(msg_key)
-                input_tokens = int(usage.get("input_tokens") or 0)
-                output_tokens = int(usage.get("output_tokens") or 0)
-                cache_read = int(usage.get("cache_read_input_tokens") or 0)
-                cache_write = int(usage.get("cache_creation_input_tokens") or 0)
-                cached = cache_read + cache_write
-                # Headline tokens exclude cache reads (the context re-read on
-                # every turn); those are reported separately.
-                fresh = input_tokens + output_tokens + cache_write
-                piece = fresh + cache_read
-                tokens += fresh
-                if day == today and model:
-                    today_tokens[model] += fresh
-                    today_cached[model] += cache_read
-                if piece and model:
-                    target = bucket(model)
-                    target["inputTokens"] += input_tokens
-                    target["outputTokens"] += output_tokens
-                    target["cachedTokens"] += cached
-                content = message.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            tools[text(block.get("name"), 60)] += 1
-        except OSError:
+        entry = log_cache.update(path, blank_transcript,
+                                 lambda e, lines, mtime, sub=is_subagent, stem=path.stem: read_transcript_lines(e, lines, mtime, sub, stem))
+        if entry is None:
             continue
-        if pending and model:
-            for day in pending:
-                add_prompt(model, day)
-        if (prompts or tokens) and model and not is_subagent:
+        for key, record in entry["msgs"].items():
+            if key in seen_messages:
+                continue
+            seen_messages.add(key)
+            add_usage(*record)
+        for key, counts in entry["loose"].items():
+            model, day_text = key.split("\x1f", 1)
+            add_usage(model, day_text, *counts)
+        prompts = list(entry["promptLog"].items())
+        if entry["model"]:
+            prompts += [(uid, [entry["model"], day_text]) for uid, day_text in entry["pending"]]
+        for uid, (model, day_text) in prompts:
+            if uid in seen_prompts:
+                continue
+            seen_prompts.add(uid)
+            add_prompt(model, dt.date.fromisoformat(day_text))
+        tools.update(entry["tools"])
+        cwd = entry["cwd"]
+        if (entry["prompts"] or entry["tokens"]) and entry["model"] and not is_subagent:
             sessions.append({
                 "conversationId": path.stem,
-                "title": preview or "Claude session",
-                "preview": preview or "Claude session",
+                "title": entry["preview"] or "Claude session",
+                "preview": entry["preview"] or "Claude session",
                 "workspace": cwd,
                 "workspaceName": Path(cwd).name if cwd else path.parent.name,
-                "updated_at": dt.datetime.fromtimestamp(updated).isoformat(),
-                "stepCount": prompts,
-                "model": model,
-                "tokenCount": tokens,
+                "updated_at": dt.datetime.fromtimestamp(entry["mtime"]).isoformat(),
+                "stepCount": entry["prompts"],
+                "model": entry["model"],
+                "tokenCount": entry["tokens"],
                 "isActive": False,
             })
+    log_cache.prune()
 
     if not sessions and (base / "sessions").exists():
         for path in (base / "sessions").glob("*.key"):
@@ -636,8 +656,6 @@ def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -
                 "resetsAt": b.get("resetTime", ""),
             })
 
-    if notify_threshold is not None and quota_groups:
-        check_and_send_quota_notifications(base, quota_groups, notify_threshold)
 
     has_stats = bool(sessions) or bool(quota_groups)
     tier_label = f"Anthropic ({plan_tier})" if plan_tier else "Anthropic"
@@ -682,12 +700,16 @@ def scan(base: Path, force: bool = False, notify_threshold: int | None = None) -
     }
 
 
+def collect(force: bool = False) -> dict:
+    """This provider's usage, for usage_scanner.py to call in-process."""
+    return scan(BASE, force=force)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--notify-low-quota", type=int, default=None)
     args = ap.parse_args()
-    print(json.dumps(scan(BASE, force=args.force, notify_threshold=args.notify_low_quota), separators=(",", ":"), ensure_ascii=False))
+    print(json.dumps(scan(BASE, force=args.force), separators=(",", ":"), ensure_ascii=False))
 
 
 if __name__ == "__main__":

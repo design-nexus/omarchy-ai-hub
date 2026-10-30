@@ -14,6 +14,8 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
+from common import FetchGate
+
 DATA_HOME = Path(os.environ.get("CURSOR_DATA_HOME", Path.home() / ".cursor"))
 CONFIG_HOME = Path(os.environ.get("CURSOR_CONFIG_HOME", Path.home() / ".config" / "cursor"))
 COLOR = "#f54e00"
@@ -107,9 +109,11 @@ def resolve_executable() -> str:
 
 
 def cursor_active(executable: str) -> bool:
+    """A Cursor agent is running. The CLI is a launcher script, so the process
+    to look for is node running the package's index.js beside it."""
     if not executable:
         return False
-    real = os.path.realpath(executable)
+    entry_point = os.path.join(os.path.dirname(os.path.realpath(executable)), "index.js").encode()
     proc = Path("/proc")
     if not proc.exists():
         return False
@@ -117,7 +121,7 @@ def cursor_active(executable: str) -> bool:
         if not entry.name.isdigit():
             continue
         try:
-            if os.path.realpath(entry / "exe") == real:
+            if entry_point in (entry / "cmdline").read_bytes().split(b"\0"):
                 return True
         except OSError:
             continue
@@ -213,11 +217,11 @@ def cursor_post(url: str, token: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def fetch_cursor_quota(data_home: Path, config_home: Path, executable: str = "agent") -> tuple[list[dict], str, str]:
+def fetch_cursor_quota(data_home: Path, config_home: Path, executable: str = "agent", force: bool = False) -> tuple[list[dict], str, str]:
     if os.environ.get("CURSOR_USAGE_SKIP_QUOTA") == "1":
         return [], "", ""
     cache = data_home / "cache" / "quota_usage_cache.json"
-    if cache.exists():
+    if cache.exists() and not force:
         try:
             age = dt.datetime.now(dt.timezone.utc).timestamp() - cache.stat().st_mtime
             if age < 180:
@@ -227,6 +231,10 @@ def fetch_cursor_quota(data_home: Path, config_home: Path, executable: str = "ag
                     return groups, str(cached.get("tier") or ""), ""
         except (OSError, ValueError, TypeError):
             pass
+    gate = FetchGate("cursor")
+    blocked = gate.blocked(force)
+    if blocked:
+        return [], "", blocked
     token = cursor_access_token(config_home)
     if not token:
         return [], "", f"No Cursor sign-in. Run `{executable} login`."
@@ -234,11 +242,14 @@ def fetch_cursor_quota(data_home: Path, config_home: Path, executable: str = "ag
         period = cursor_post(PERIOD_URL, token)
         plan_info = cursor_post(PLAN_URL, token)
     except urllib.error.HTTPError as error:
-        if error.code in (401, 403):
-            return [], "", f"Cursor sign-in expired. Run `{executable} login`."
-        return [], "", f"Cursor quota returned status {error.code}"
+        message = (f"Cursor sign-in expired. Run `{executable} login`." if error.code in (401, 403)
+                   else f"Cursor quota returned status {error.code}")
+        gate.failed(message)
+        return [], "", message
     except (OSError, ValueError, urllib.error.URLError) as exc:
+        gate.failed(str(exc))
         return [], "", str(exc)
+    gate.succeeded()
     groups, tier = quota_from_cursor_period(period, plan_info)
     if groups:
         try:
@@ -548,7 +559,7 @@ def transcript_id(path: Path) -> str:
     return path.stem
 
 
-def scan(data_home: Path, config_home: Path) -> dict:
+def scan(data_home: Path, config_home: Path, force: bool = False) -> dict:
     today = dt.date.today()
     week = {str(today - dt.timedelta(days=i)) for i in range(7)}
     sessions: dict[str, dict] = {}
@@ -627,7 +638,7 @@ def scan(data_home: Path, config_home: Path) -> dict:
     visible.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
     if active and visible:
         visible[0]["isActive"] = True
-    groups, quota_tier, quota_error = fetch_cursor_quota(data_home, config_home, Path(executable).name if executable else "agent")
+    groups, quota_tier, quota_error = fetch_cursor_quota(data_home, config_home, Path(executable).name if executable else "agent", force)
     tier = quota_tier or plan_tier(executable, data_home)
     model_list = sorted(models.values(), key=lambda item: (item["prompts"], item["steps"], item["name"]), reverse=True)
     days = []
@@ -687,6 +698,11 @@ def scan(data_home: Path, config_home: Path) -> dict:
             "executable": Path(executable).name if executable else "agent",
         },
     }
+
+
+def collect(force: bool = False) -> dict:
+    """This provider's usage, for usage_scanner.py to call in-process."""
+    return scan(DATA_HOME, CONFIG_HOME, force=force)
 
 
 def main() -> None:

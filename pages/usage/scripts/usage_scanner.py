@@ -5,28 +5,31 @@ Every result includes availability, activity, quota buckets, local usage, sessio
 errors, and presentation metadata. Network quota is not estimated for Claude,
 Copilot, or Muse. XSI is Grok and Cursor together: their plans share one quota
 pool, so it shows Grok's billing once and merges both CLIs' stats and sessions.
+
+Each provider's scanner is imported and called in this process; `busy` tells the
+hub which providers deserve the fast refresh.
 """
 from __future__ import annotations
-import argparse, datetime as dt, json, os, shutil, subprocess, sys
+import argparse, datetime as dt, importlib, json, os, shutil, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
 META = {
-    "codex": ("Codex", "#22c7b8", "codex_usage_scanner.py", "codex", "OpenAI"),
+    "codex": ("Codex", "#22c7b8", "codex_usage_scanner", "codex", "OpenAI"),
     "xsi": ("XSI", "#a855f7", "", "grok", "xAI"),
-    "antigravity": ("Antigravity", "#3b82f6", "antigravity_usage_scanner.py", "agy", "Google DeepMind"),
-    "claude": ("Claude Code", "#f97316", "claude_usage_scanner.py", "claude", "Anthropic"),
-    "copilot": ("Copilot", "#1f6feb", "copilot_usage_scanner.py", "copilot", "GitHub"),
-    "muse": ("Muse", "#0082FB", "muse_usage_scanner.py", "muse", "Meta"),
+    "antigravity": ("Antigravity", "#3b82f6", "antigravity_usage_scanner", "agy", "Google DeepMind"),
+    "claude": ("Claude Code", "#f97316", "claude_usage_scanner", "claude", "Anthropic"),
+    "copilot": ("Copilot", "#1f6feb", "copilot_usage_scanner", "copilot", "GitHub"),
+    "muse": ("Muse", "#0082FB", "muse_usage_scanner", "muse", "Meta"),
 }
 # XSI's sources, in quota priority: Grok's billing has the whole shared pool.
 XSI_SOURCES = (
-    ("grok", "Grok", "grok_usage_scanner.py"),
-    ("cursor", "Cursor", "cursor_usage_scanner.py"),
+    ("grok", "Grok", "grok_usage_scanner"),
+    ("cursor", "Cursor", "cursor_usage_scanner"),
 )
-NO_QUOTA_NOTIFY = {"copilot", "muse"}
+# A live session counts as busy while its log changed this recently.
+BUSY_WINDOW_SEC = 120
 QUOTA_NOTES = {
     "copilot": "Monthly allowance is not stored locally.",
     "muse": "Muse quota is not estimated.",
@@ -75,46 +78,44 @@ def empty(provider, available, error=""):
       "usageStatusText": error or ("CLI not installed" if not available else "No local activity found"),
       "authHelpText": "" if available else ("Install " + install + " to collect usage."), "error": error}
 
-def run_scanner(script, args):
-    """A child scanner's JSON, or {"error": ...} when it fails."""
+def run_collector(module, force):
+    """A scanner module's result, or {"error": ...} when it fails."""
     try:
-        run = subprocess.run([sys.executable, str(ROOT / script)] + args,
-                             capture_output=True, text=True, timeout=25, check=False)
-        if run.stdout.strip():
-            return json.loads(run.stdout)
-        return {"error": run.stderr.strip() or "Scanner returned no data"}
+        data = importlib.import_module(module).collect(force=force)
+        return data if isinstance(data, dict) else {"error": "Scanner returned no data"}
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc) or type(exc).__name__}
 
 def session_time(session):
-    raw = str(session.get("updated_at") or "")
+    raw = session.get("updated_at") or session.get("lastModified") or ""
+    if isinstance(raw, (int, float)):
+        return raw / 1000 if raw > 1e12 else float(raw)
     try:
         # Grok writes UTC with a Z; Cursor writes local time with no zone, which
         # timestamp() reads as local.
-        return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        return dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
+
+def busy(data):
+    if not data.get("hasActiveSession"):
+        return False
+    sessions = (data.get("activeSessions") or []) + (data.get("recentSessions") or [])[:3]
+    return any(time.time() - session_time(s) < BUSY_WINDOW_SEC for s in sessions)
 
 def add_counts(target, source):
     for key, value in (source or {}).items():
         if isinstance(value, (int, float)):
             target[key] = target.get(key, 0) + value
 
-def merge_xsi(force, notify):
-    sources = [(source, label, script, source_executable(source)) for source, label, script in XSI_SOURCES]
+def merge_xsi(force):
+    sources = [(source, label, module, source_executable(source)) for source, label, module in XSI_SOURCES]
     sources = [entry for entry in sources if entry[3]]
     if not sources:
         return empty("xsi", False)
 
-    def scan(entry):
-        source, _, script, _ = entry
-        args = ["--force"] if force else []
-        if source == "grok" and notify is not None:
-            args += ["--notify-low-quota", str(notify)]
-        return run_scanner(script, args)
-
     with ThreadPoolExecutor(len(sources)) as pool:
-        results = list(pool.map(scan, sources))
+        results = list(pool.map(lambda entry: run_collector(entry[2], force), sources))
     parts = [(source, label, (data.get("display") or {}).get("executable") or exe, data)
              for (source, label, _, exe), data in zip(sources, results)]
 
@@ -194,25 +195,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("provider", choices=META)
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--notify-low-quota", type=int)
     args = ap.parse_args()
     if args.provider == "xsi":
-        print(json.dumps(merge_xsi(args.force, args.notify_low_quota), separators=(",", ":"), ensure_ascii=False))
-        return
-    name, color, script, executable, _ = META[args.provider]
-    if not installed(args.provider, executable):
-        print(json.dumps(empty(args.provider, False)))
-        return
-    command = []
-    if args.force: command.append("--force")
-    if args.notify_low_quota is not None and args.provider not in NO_QUOTA_NOTIFY:
-        command += ["--notify-low-quota", str(args.notify_low_quota)]
-    data = run_scanner(script, command)
+        data = merge_xsi(args.force)
+    else:
+        data = scan_provider(args.provider, args.force)
+    data["busy"] = busy(data)
+    print(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
+
+def scan_provider(provider, force):
+    name, color, module, executable, _ = META[provider]
+    if not installed(provider, executable):
+        return empty(provider, False)
+    data = run_collector(module, force)
     if set(data) == {"error"}:
-        data = empty(args.provider, True, data["error"])
+        data = empty(provider, True, data["error"])
     child_exe = (data.get("display") or {}).get("executable") or executable
-    data.update({"schemaVersion": 2, "providerId": args.provider, "id": args.provider, "name": name,
+    data.update({"schemaVersion": 2, "providerId": provider, "id": provider, "name": name,
                  "display": {"name": name, "color": color, "executable": child_exe}, "available": True})
     data.setdefault("error", "")
-    print(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
+    return data
+
 if __name__ == "__main__": main()

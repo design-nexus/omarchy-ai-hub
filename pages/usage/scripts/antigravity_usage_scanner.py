@@ -147,7 +147,6 @@ def empty_result(base_dir: Path | None = None) -> dict[str, Any]:
     }
 
 
-
 def parse_history_file(history_path: Path, recent_dates: list[str]) -> tuple[dict[str, int], int, list[dict[str, Any]], Counter]:
     daily_prompts = {day: 0 for day in recent_dates}
     total_prompts = 0
@@ -985,145 +984,6 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
     return formatted
 
 
-def check_and_send_quota_notifications(
-    base_dir: Path,
-    quota_groups: list[dict[str, Any]],
-    threshold_pct: int = 15,
-) -> None:
-    """Send unified desktop notification when model quota drops below threshold.
-
-    Guarantees:
-    1. Concurrency-safe: Uses non-blocking flock on a dedicated lock file so only ONE
-       monitor process can check or send at a time; concurrent monitor bars exit immediately.
-    2. No recurring spam: Tracks quota state on disk. Once notified for a low-quota event,
-       does NOT re-notify every 2 hours while quota sits at 0%. Only re-notifies if:
-       - Quota replenished above threshold and drops again, OR
-       - Quota escalates from warning (>5%) to critical (<=5%) with at least 1h separation.
-    3. Multi-bucket consolidation: Consolidates all low buckets in the same model group
-       into a single notification.
-    """
-    if not quota_groups:
-        return
-
-    cache_dir = base_dir / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_dir / "quota_notification.lock"
-    state_path = cache_dir / "quota_notification_state.json"
-
-    # Non-blocking lock: if another monitor process is currently in this critical section, exit immediately
-    lock_fd = None
-    try:
-        lock_fd = open(lock_path, "w")
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (BlockingIOError, OSError):
-        if lock_fd:
-            try:
-                lock_fd.close()
-            except Exception:
-                pass
-        return
-
-    try:
-        now = time.time()
-        state_data: dict[str, dict[str, Any]] = {}
-        if state_path.exists():
-            try:
-                with open(state_path, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                    if isinstance(d, dict):
-                        state_data = d
-            except Exception:
-                state_data = {}
-
-        modified = False
-
-        for group in quota_groups:
-            g_name = group.get("name") or "Model Group"
-            buckets = group.get("buckets") or []
-            if not buckets:
-                continue
-
-            low_buckets = []
-            min_pct = 100
-            for b in buckets:
-                rem_pct = b.get("remainingPercent")
-                if rem_pct is None:
-                    rem_frac = b.get("remainingFraction", 1.0)
-                    rem_pct = round(rem_frac * 100)
-                if rem_pct <= threshold_pct:
-                    label = b.get("label") or b.get("name") or "Limit"
-                    low_buckets.append(f"{label} ({rem_pct}%)")
-                    min_pct = min(min_pct, rem_pct)
-
-            group_state = state_data.get(g_name, {})
-            was_low = bool(group_state.get("alert_active", False))
-            last_notified_pct = group_state.get("last_notified_pct", 100)
-            last_notified_time = float(group_state.get("last_notified_time", 0.0))
-
-            if not low_buckets:
-                # Quota is healthy (above threshold)
-                if was_low:
-                    # Quota replenished! Reset state so future drops trigger an alert
-                    group_state["alert_active"] = False
-                    group_state["last_notified_pct"] = 100
-                    state_data[g_name] = group_state
-                    modified = True
-                continue
-
-            # Quota is currently low
-            should_notify = False
-            if not was_low:
-                # First time dropping below threshold
-                should_notify = True
-            elif min_pct <= 5 and last_notified_pct > 5 and (now - last_notified_time > 3600):
-                # Escalation from warning (>5%) to critical (<=5%)
-                should_notify = True
-
-            if should_notify:
-                headline = f"Antigravity Quota Low ({min_pct}% remaining)"
-                details = f"{g_name}: {', '.join(low_buckets)} remaining."
-                urgency = "critical" if min_pct <= 5 else "normal"
-
-                cmd = [
-                    "omarchy-notification-send",
-                    "--app-name", "antigravity-usage",
-                    "-u", urgency,
-                    "-g", "󰢌",
-                    headline,
-                    details
-                ]
-
-                try:
-                    subprocess.run(cmd, capture_output=True, timeout=4)
-                    group_state["alert_active"] = True
-                    group_state["last_notified_pct"] = min_pct
-                    group_state["last_notified_time"] = now
-                    state_data[g_name] = group_state
-                    modified = True
-                except Exception:
-                    pass
-            elif not was_low:
-                # In case notification delivery failed, mark active to avoid tight retry loop
-                group_state["alert_active"] = True
-                state_data[g_name] = group_state
-                modified = True
-
-        if modified:
-            try:
-                tmp_state = state_path.with_suffix(".tmp")
-                with open(tmp_state, "w", encoding="utf-8") as f:
-                    json.dump(state_data, f, indent=2)
-                tmp_state.replace(state_path)
-            except Exception:
-                pass
-    finally:
-        try:
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
-            lock_fd.close()
-        except Exception:
-            pass
-
-
 def pb_fields(buf: bytes):
     """Yield (field, value) for one protobuf message; nested messages stay bytes."""
     i, n = 0, len(buf)
@@ -1196,7 +1056,7 @@ def today_token_usage(conversations_dir: Path, today: dt.date) -> tuple[int, int
     return total, cached
 
 
-def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None) -> dict[str, Any]:
+def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
     if not base_dir.exists():
         return empty_result(base_dir)
 
@@ -1209,8 +1069,6 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
                 with open(scan_cache_path, "r", encoding="utf-8") as f:
                     cached = json.load(f)
                     if isinstance(cached, dict) and cached.get("ready"):
-                        if alert_threshold is not None:
-                            check_and_send_quota_notifications(base_dir, cached.get("quotaGroups", []), threshold_pct=alert_threshold)
                         return cached
         except Exception:
             pass
@@ -1244,8 +1102,6 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
     raw_quota = fetch_agy_usage_quota(base_dir, force=force)
     quota_groups = format_quota_groups(raw_quota, base_dir=base_dir)
 
-    if alert_threshold is not None:
-        check_and_send_quota_notifications(base_dir, quota_groups, threshold_pct=alert_threshold)
 
     # 5. Build Unified Session Registry
     conv_map: dict[str, dict[str, Any]] = {}
@@ -1547,6 +1403,11 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
 scan_antigravity = scan
 
 
+def collect(force: bool = False) -> dict:
+    """This provider's usage, for usage_scanner.py to call in-process."""
+    return scan(default_base_dir(), force=force)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Antigravity Usage Scanner")
     parser.add_argument("path", nargs="?", default=None, help="Path to ~/.gemini/antigravity-cli")
@@ -1554,7 +1415,6 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Bypass cache and force refresh from agy /usage")
     parser.add_argument("--kill", type=str, default=None, help="Kill the running session by conversation ID")
     parser.add_argument("--refresh-quota-bg", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--notify-low-quota", type=int, nargs="?", const=15, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     base_dir = expand_path(args.path) if args.path else default_base_dir()
@@ -1568,7 +1428,7 @@ def main() -> None:
         print(json.dumps({"success": success, "conversationId": args.kill}))
         return
 
-    result = scan(base_dir, force=args.force, alert_threshold=args.notify_low_quota)
+    result = scan(base_dir, force=args.force)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

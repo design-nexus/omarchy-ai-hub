@@ -288,6 +288,18 @@ def parse_session_index(base_dir: Path) -> list[dict[str, Any]]:
     return sessions
 
 
+# Codex processes that are not a session you are running: the ChatGPT desktop
+# app's bundled codex, and the app-server, exec-server and MCP daemons.
+DAEMON_COMMANDS = {"app-server", "exec-server", "mcp-server", "mcp"}
+
+
+def not_a_session(argv: list[str]) -> bool:
+    exe = argv[0] if argv else ""
+    if exe.startswith("/usr/lib/chatgpt/") or "/app-server-daemon/" in exe:
+        return True
+    return bool(DAEMON_COMMANDS.intersection(argv[1:]))
+
+
 def get_active_codex_pids() -> dict[str, int]:
     """Find interactive codex processes, keyed by conversation ID when the
     command line names one and by ``cwd:<dir>`` otherwise.
@@ -316,7 +328,8 @@ def get_active_codex_pids() -> dict[str, int]:
                     try:
                         proc_dir = Path(f"/proc/{pid}")
                         cmd = (proc_dir / "cmdline").read_bytes().decode("utf-8", errors="replace")
-                        if "app-server" in cmd.split("\0"):
+                        argv = cmd.split("\0")
+                        if not_a_session(argv):
                             continue
                         status = (proc_dir / "status").read_text(errors="replace")
                         if re.search(r"^State:\s*Z", status, re.M):
@@ -348,19 +361,31 @@ def session_cwd(base_dir: Path, cid: str) -> str:
     return ""
 
 
+def holds_session_file(pid: int, cid: str) -> bool:
+    try:
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                if cid in os.readlink(fd):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
 def kill_session(cid: str, base_dir: Path) -> bool:
     """Terminate the codex process running ``cid``.
 
-    Uses the same process mapping as the active-session marker: a codex
-    process naming the conversation ID, else one running in its directory.
-    Only processes whose executable is ``codex`` are considered.
+    A codex session process naming the conversation ID, else one holding the
+    session's rollout file open. Sharing a working directory is not enough:
+    that would kill whatever other codex happens to run there.
     """
     import signal
     running = get_active_codex_pids()
     pid = running.get(cid)
     if pid is None:
-        cwd = session_cwd(base_dir, cid)
-        pid = running.get("cwd:" + cwd) if cwd else None
+        pid = next((p for p in running.values() if holds_session_file(p, cid)), None)
     if not pid:
         return False
     try:
@@ -509,56 +534,7 @@ def fetch_codex_rpc_quota(base_dir: Path, force: bool = False) -> tuple[list[dic
     return limits_data, tier, error_str
 
 
-def check_and_send_quota_notifications(base_dir: Path, groups: list[dict[str, Any]], threshold_pct: int = 15) -> None:
-    notify_cmd = shutil.which("omarchy-notification-send") or "/usr/share/omarchy/bin/omarchy-notification-send"
-    if not notify_cmd or not Path(notify_cmd).exists():
-        return
-
-    cooldown_file = base_dir / "cache" / "low_quota_notified.json"
-    cooldown_file.parent.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    notified_state: dict[str, float] = {}
-
-    if cooldown_file.exists():
-        try:
-            with open(cooldown_file, "r", encoding="utf-8") as f:
-                notified_state = json.load(f)
-        except Exception:
-            notified_state = {}
-
-    dirty = False
-    for g in groups:
-        for b in g.get("buckets", []):
-            rem_pct = b.get("remainingPercent", round((b.get("remainingFraction", 1.0) * 100)))
-            bid = b.get("id") or b.get("name")
-            if not bid:
-                continue
-
-            if rem_pct <= threshold_pct:
-                last_sent = notified_state.get(bid, 0)
-                if now - last_sent > 7200:
-                    b_label = b.get("label") or b.get("name") or "ChatGPT Quota"
-                    msg = f"{b_label} is down to {rem_pct}% remaining."
-                    try:
-                        subprocess.run(
-                            [notify_cmd, "ChatGPT Quota Warning", msg, "--category", "ai"],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        notified_state[bid] = now
-                        dirty = True
-                    except Exception:
-                        pass
-
-    if dirty:
-        try:
-            with open(cooldown_file, "w", encoding="utf-8") as f:
-                json.dump(notified_state, f)
-        except Exception:
-            pass
-
-
-def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = None) -> dict[str, Any]:
+def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
     res = empty_result(base_dir)
     recent_dates = recent_date_strings()
     today_str = date_string(dt.datetime.now().date())
@@ -756,8 +732,6 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
                 "resetsAt": b.get("resetTime", ""),
             })
 
-    if notify_threshold is not None and groups:
-        check_and_send_quota_notifications(base_dir, groups, notify_threshold)
 
     # Build model list sorted by usage
     model_list = list(model_usage.values())
@@ -794,11 +768,15 @@ def scan(base_dir: Path, force: bool = False, notify_threshold: int | None = Non
     return res
 
 
+def collect(force: bool = False) -> dict:
+    """This provider's usage, for usage_scanner.py to call in-process."""
+    return scan(default_base_dir(), force=force)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ChatGPT / Codex Usage Scanner for Omarchy")
     parser.add_argument("--force", action="store_true", help="Force refresh bypassing caches")
     parser.add_argument("--kill", type=str, metavar="CID", help="Kill session by conversation ID")
-    parser.add_argument("--notify-low-quota", type=int, metavar="PCT", help="Check and notify if quota below PCT")
     args = parser.parse_args()
 
     base_dir = default_base_dir()
@@ -808,7 +786,7 @@ def main() -> None:
         print(json.dumps({"killed": killed, "conversationId": args.kill}))
         return
 
-    data = scan(base_dir, force=args.force, notify_threshold=args.notify_low_quota)
+    data = scan(base_dir, force=args.force)
     print(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
 
 

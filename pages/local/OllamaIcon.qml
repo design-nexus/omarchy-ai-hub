@@ -76,7 +76,7 @@ Item {
     y: parent.height - height
 
     SequentialAnimation on opacity {
-      running: root.hasActiveModel
+      running: root.hasActiveModel && root.visible
       loops: Animation.Infinite
       NumberAnimation { from: .25; to: 1; duration: 600; easing.type: Easing.InOutQuad }
       NumberAnimation { from: 1; to: .25; duration: 600; easing.type: Easing.InOutQuad }

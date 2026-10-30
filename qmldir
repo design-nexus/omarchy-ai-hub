@@ -1,4 +1,5 @@
 singleton HubStyle 1.0 HubStyle.qml
+singleton HubServices 1.0 HubServices.qml
 HubHero 1.0 HubHero.qml
 HubPill 1.0 HubPill.qml
 HubSection 1.0 HubSection.qml

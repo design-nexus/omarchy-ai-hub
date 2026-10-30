@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import qs.Commons
 import qs.Ui
+import "../.."
 
 // The Local page: LM Studio and Ollama, each switchable in the hub settings.
 // Its settings live under the hub entry's `local` key: showLmStudio,
@@ -42,27 +43,17 @@ BarWidget {
 
   onBarChanged: injectPanel()
 
-  LmStudioService {
-    id: lmSvc
-    settings: root.settings
-    polling: root.showLmStudio
-  }
-  property alias lmstudio: lmSvc
-
-  OllamaService {
-    id: ollamaSvc
-    settings: root.settings
-    polling: root.showOllama
-  }
-  property alias ollama: ollamaSvc
+  // Shared by every bar; HubServices polls them once for the whole shell.
+  readonly property var lmstudio: HubServices.lmstudio
+  readonly property var ollama: HubServices.ollama
 
   Loader {
     id: panelLoader
     active: true
     visible: false
     Component.onCompleted: setSource(Qt.resolvedUrl("Content.qml"), {
-      "lmstudio": lmSvc,
-      "ollama": ollamaSvc
+      "lmstudio": root.lmstudio,
+      "ollama": root.ollama
     })
     onLoaded: {
       item.showLmStudio = Qt.binding(function() { return root.showLmStudio })

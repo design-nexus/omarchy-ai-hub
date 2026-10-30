@@ -12,6 +12,8 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
+from common import FetchGate
+
 HOME = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot"))
 COLOR = "#1f6feb"
 QUOTA_NOTE = "Monthly allowance is not stored locally."
@@ -186,8 +188,14 @@ def fetch_copilot_quota(home: Path) -> tuple[list[dict], str, str]:
                     return groups, str(cached.get("tier") or ""), ""
         except (OSError, ValueError, TypeError):
             pass
+    # Also spares `gh auth token` (a process per run) while quota is failing.
+    gate = FetchGate("copilot")
+    blocked = gate.blocked()
+    if blocked:
+        return [], "", blocked
     token = github_token()
     if not token:
+        gate.failed("No GitHub token. Run `gh auth login`.")
         return [], "", "No GitHub token. Run `gh auth login`."
     request = urllib.request.Request(QUOTA_URL, headers={
         "Authorization": f"Bearer {token}",
@@ -201,11 +209,14 @@ def fetch_copilot_quota(home: Path) -> tuple[list[dict], str, str]:
         with urllib.request.urlopen(request, timeout=12) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as error:
-        if error.code in (401, 403):
-            return [], "", "GitHub sign-in cannot read Copilot quota. Run `gh auth login`."
-        return [], "", f"Copilot quota returned status {error.code}"
+        message = ("GitHub sign-in cannot read Copilot quota. Run `gh auth login`." if error.code in (401, 403)
+                   else f"Copilot quota returned status {error.code}")
+        gate.failed(message)
+        return [], "", message
     except (OSError, ValueError, urllib.error.URLError) as exc:
+        gate.failed(str(exc))
         return [], "", str(exc)
+    gate.succeeded()
     if not isinstance(payload, dict):
         return [], "", "Copilot quota response was empty"
     groups, tier = quota_from_copilot_user(payload)
@@ -553,6 +564,11 @@ def scan(home: Path) -> dict:
         "usageStatusText": "",
         "authHelpText": "",
     }
+
+
+def collect(force: bool = False) -> dict:
+    """This provider's usage, for usage_scanner.py to call in-process."""
+    return scan(HOME)
 
 
 def main() -> None:

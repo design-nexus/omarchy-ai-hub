@@ -65,12 +65,31 @@ Item {
     if (!killable) return ""
     return scriptPath(((session && session.source) || providerId) + "_usage_scanner.py")
   }
+  // A live session whose log changed in the last two minutes (usage_scanner.py).
+  property bool busy: data.busy === true
+  // Off when the Usage tab is hidden: no polling at all.
+  property bool polling: true
+  property int intervalSec: 60
   readonly property string scanner: scriptPath("usage_scanner.py")
-  function scriptPath(name) { return String(Qt.resolvedUrl("../scripts/" + name)).replace("file://", "") }
+  function scriptPath(name) { return decodeURIComponent(String(Qt.resolvedUrl("../scripts/" + name)).replace("file://", "")) }
   Process {
     id: process
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.apply(text) }
-    onExited: root.refreshing = false
+    onExited: { root.refreshing = false; watchdog.stop() }
+  }
+  // Only the provider being worked in refreshes fast; the rest wait their interval.
+  Timer {
+    interval: root.busy ? 10000 : root.intervalSec * 1000
+    running: root.polling && root.agentEnabled
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refresh(false)
+  }
+  // A scanner that hangs would otherwise hold `refreshing` and block every later refresh.
+  Timer {
+    id: watchdog
+    interval: 60000
+    onTriggered: if (process.running) process.running = false
   }
   function apply(text) {
     try {
@@ -82,11 +101,10 @@ Item {
     loaded = true
   }
   function refresh(force) {
-    if (process.running) return
-    var cmd = ["python3", scanner, providerId]
+    if (process.running || !polling) return
+    var cmd = ["/usr/bin/python3", scanner, providerId]
     if (force) cmd.push("--force")
-    // usage_scanner.py ignores this for agents without quota alerts.
-    if (settings.enableQuotaAlerts !== false) cmd.push("--notify-low-quota", String(settings.quotaAlertThreshold || 15))
     refreshing = true; process.command = cmd; process.running = true
+    watchdog.restart()
   }
 }

@@ -268,6 +268,9 @@ window_map() {
 }
 
 # ---------------------------------------------------------------- listing
+#
+# Every call into a herdr server is capped at 2 s: a wedged server must not
+# hold the poll, which every bar's Live tab and the hub's dot wait on.
 
 # One session's agents and workspaces, from its own server. `--session` is
 # left off for the default one: passing it by name would address a *named*
@@ -278,9 +281,9 @@ snapshot_for() {
   # `|| true` because the cap in front of this can close the pipe on the
   # server, and a SIGPIPE there is a bounded read rather than a failure.
   if [[ $is_default == true ]]; then
-    out=$(herdr api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
+    out=$(timeout 2 herdr api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
   else
-    out=$(herdr --session "$name" api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
+    out=$(timeout 2 herdr --session "$name" api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
   fi
   [[ -n $out ]] || return 1
   # One oversized server is skipped rather than allowed to take the list down:
@@ -292,7 +295,7 @@ snapshot_for() {
 
 cmd_list() {
   local sessions_json
-  sessions_json=$(herdr session list --json 2>/dev/null | head -c "$((SESSIONS_BYTE_CAP + 1))") || true
+  sessions_json=$(timeout 2 herdr session list --json 2>/dev/null | head -c "$((SESSIONS_BYTE_CAP + 1))") || true
   [[ -n $sessions_json ]] || die "could not reach herdr"
   over_byte_cap "$sessions_json" "$SESSIONS_BYTE_CAP" && die "session list too large to read safely"
 
@@ -576,7 +579,7 @@ server_pid_for() {
 }
 
 socket_of() {
-  herdr session list --json 2>/dev/null |
+  timeout 2 herdr session list --json 2>/dev/null |
     jq -r --arg name "$1" '.sessions[]? | select(.name == $name) | .socket_path // ""' 2>/dev/null
 }
 

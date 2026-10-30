@@ -50,6 +50,9 @@ BarWidget {
 
   // ------------------------------------------------------------- Providers
   readonly property var provider: usageMain.providerFor(selectedProviderId)
+  // What the cards draw: nothing while the page is closed, so a scan landing
+  // in the background doesn't rebuild every card nobody can see.
+  readonly property var shownProvider: popupOpen ? provider : null
   readonly property var installedProviders: usageMain.enabledProviders || []
   readonly property var allProviders: usageMain.allProviders || []
   readonly property url iconSource: Qt.resolvedUrl("assets/omarchy.png")
@@ -414,10 +417,8 @@ BarWidget {
     onTriggered: root.nowMs = Date.now()
   }
 
-  Main {
-    id: usageMain
-    settings: root.settings
-  }
+  // The providers are polled once for every bar, in HubServices.
+  readonly property var usageMain: HubServices.usage
 
   Timer {
     id: refreshFlashTimer
@@ -515,7 +516,7 @@ BarWidget {
           x: (index % 3) * ((iconArea.width - width) / 2)
           y: index < 3 ? 0 : iconArea.height - height
           SequentialAnimation on opacity {
-            running: live
+            running: live && visible
             loops: Animation.Infinite
             NumberAnimation { from: .25; to: 1; duration: 600; easing.type: Easing.InOutQuad }
             NumberAnimation { from: 1; to: .25; duration: 600; easing.type: Easing.InOutQuad }
@@ -728,13 +729,13 @@ BarWidget {
               text: "All agents are disabled. Press s to turn one on."
             }
 
-            StatusCard { provider: root.settingsMode ? null : root.provider }
-            TodayCard { provider: root.provider }
-            QuotaLimitsCard { provider: root.provider }
-            ModelUsageCard { provider: root.provider }
-            WeekCard { provider: root.provider }
-            ToolsCard { provider: root.provider }
-            RecentSessionsCard { provider: root.provider }
+            StatusCard { provider: root.settingsMode ? null : root.shownProvider }
+            TodayCard { provider: root.shownProvider }
+            QuotaLimitsCard { provider: root.shownProvider }
+            ModelUsageCard { provider: root.shownProvider }
+            WeekCard { provider: root.shownProvider }
+            ToolsCard { provider: root.shownProvider }
+            RecentSessionsCard { provider: root.shownProvider }
 
             FooterText {
               visible: root.cardsVisible(root.provider)
@@ -941,7 +942,7 @@ BarWidget {
 
       IconButton {
         iconText: ""
-        iconSpinning: usageMain.refreshing
+        iconSpinning: root.popupOpen && usageMain.refreshing
         tooltipText: "Refresh (r)"
         active: root.refreshFlash || usageMain.refreshing
         onClicked: {
@@ -1090,7 +1091,7 @@ BarWidget {
 
     SequentialAnimation on opacity {
       loops: Animation.Infinite
-      running: root.popupOpen
+      running: root.popupOpen && visible
       NumberAnimation { from: 0.4; to: 0.85; duration: 800; easing.type: Easing.InOutQuad }
       NumberAnimation { from: 0.85; to: 0.4; duration: 800; easing.type: Easing.InOutQuad }
     }
