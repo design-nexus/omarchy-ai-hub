@@ -46,6 +46,14 @@ def stamp(value) -> float:
     return 0
 
 
+def mtime_of(path: Path) -> float:
+    """0 for a file removed while the scan runs."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def local_day(timestamp: float) -> dt.date | None:
     if not timestamp:
         return None
@@ -179,17 +187,50 @@ def quota_from_cursor_period(period: dict, plan_info: dict | None = None) -> tup
 
     total = bucket("cursor-included", included_label, usage.get("totalPercentUsed"), message)
     auto = bucket("cursor-auto", "Auto models", usage.get("autoPercentUsed"), str(period.get("autoModelSelectedDisplayMessage") or ""))
-    api = bucket("cursor-api", "API models", usage.get("apiPercentUsed"), str(period.get("namedModelSelectedDisplayMessage") or ""))
+    # Models picked by name draw on their own allowance, apart from the Auto
+    # pool (which a SuperGrok plan shares with Grok), so it always shows.
+    api = bucket("cursor-api", "Cursor API", usage.get("apiPercentUsed"), str(period.get("namedModelSelectedDisplayMessage") or ""))
     buckets = []
     if total:
         buckets.append(total)
     if auto and (not total or auto["usedPercent"] != total["usedPercent"]):
         buckets.append(auto)
-    if api and (not total or api["usedPercent"] != total["usedPercent"]):
+    if api:
         buckets.append(api)
+    spend = on_demand_bucket(period.get("spendLimitUsage") or period.get("spend_limit_usage"), reset_time)
+    if spend:
+        buckets.append(spend)
     if not buckets:
         return [], tier
     return [{"name": "Cursor", "buckets": buckets}], tier
+
+
+def on_demand_bucket(spend, reset_time: str) -> dict | None:
+    """On-demand spend against its limit, once Cursor reports amounts (in cents).
+    Until then the entry only names the limit's type, and nothing shows."""
+    if not isinstance(spend, dict):
+        return None
+    for prefix in ("individual", "pooled"):
+        try:
+            used = float(spend.get(prefix + "Used"))
+            limit = float(spend.get(prefix + "Limit"))
+        except (TypeError, ValueError):
+            continue
+        if limit <= 0:
+            continue
+        used_pct = max(0.0, min(100.0, used / limit * 100))
+        return {
+            "id": "cursor-on-demand",
+            "name": "On-demand",
+            "label": "On-demand",
+            "remainingFraction": (100 - used_pct) / 100,
+            "remainingPercent": round(100 - used_pct),
+            "usedPercent": round(used_pct),
+            "resetTime": reset_time,
+            "forecastText": f"${used / 100:.2f} of ${limit / 100:.2f}",
+            "color": COLOR,
+        }
+    return None
 
 
 def cursor_access_token(config_home: Path) -> str:
@@ -320,7 +361,7 @@ def message_of(obj: dict) -> tuple[str, dict]:
 
 
 def read_jsonl(path: Path, session: dict, tools: Counter, models: dict[str, dict], daily_prompts: Counter, daily_steps: Counter, today: dt.date, week: set[str]) -> None:
-    when = session["updated_ts"] or path.stat().st_mtime
+    when = session["updated_ts"] or mtime_of(path)
     try:
         handle = path.open(encoding="utf-8", errors="replace")
     except OSError:
@@ -430,7 +471,7 @@ def read_meta(path: Path, sessions: dict[str, dict]) -> None:
     if title and session["title"] == "Cursor session":
         session["title"] = title
     session["workspace"] = session["workspace"] or str(data.get("cwd") or "")
-    session["updated_ts"] = max(session["updated_ts"], updated or created or path.stat().st_mtime)
+    session["updated_ts"] = max(session["updated_ts"], updated or created or mtime_of(path))
     if preview and not session["preview"]:
         session["preview"] = preview
     if prompt_count:
@@ -582,7 +623,7 @@ def scan(data_home: Path, config_home: Path, force: bool = False) -> dict:
     newest: dict[tuple[str, str], Path] = {}
     for path in transcripts:
         key = (transcript_id(path), path.suffix)
-        if key not in newest or path.stat().st_mtime > newest[key].stat().st_mtime:
+        if key not in newest or mtime_of(path) > mtime_of(newest[key]):
             newest[key] = path
     transcripts = list(newest.values())
     jsonl_ids = {transcript_id(path) for path in transcripts if path.suffix == ".jsonl"}
@@ -598,8 +639,8 @@ def scan(data_home: Path, config_home: Path, force: bool = False) -> dict:
             except OSError:
                 user_lines = []
             session["prompts"] = len(user_lines)
-            session["promptDay"] = local_day(path.stat().st_mtime) or today
-            session["updated_ts"] = max(session["updated_ts"], path.stat().st_mtime)
+            session["promptDay"] = local_day(mtime_of(path)) or today
+            session["updated_ts"] = max(session["updated_ts"], mtime_of(path))
             if user_lines and not session["preview"]:
                 session["preview"] = clip(user_lines[0].split(":", 1)[-1])
     for root in (config_home / "chats", data_home / "chats"):
@@ -685,6 +726,7 @@ def scan(data_home: Path, config_home: Path, force: bool = False) -> dict:
         "modelList": model_list,
         "quotaGroups": groups,
         "quotaNote": "" if groups else (quota_error or QUOTA_NOTE),
+        "quotaError": quota_error,
         "limits": [],
         "recentWorkspaces": [],
         "premiumRequests": 0,

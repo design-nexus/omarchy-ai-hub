@@ -41,6 +41,9 @@ Item {
   property string executable: data.display ? data.display.executable : providerId
   property bool canKill: data.canKill !== false
   property string quotaNote: data.quotaNote || ""
+  // Why the quota shown is cached rather than fresh, and when it was fetched.
+  property string quotaError: data.quotaError || ""
+  property double quotaUpdatedMs: data.quotaUpdatedAt ? Date.parse(data.quotaUpdatedAt) : 0
   property string planTier: data.planTier || ""
   readonly property bool agentEnabled: {
     var key = ({

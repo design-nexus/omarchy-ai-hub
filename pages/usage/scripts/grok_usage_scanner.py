@@ -20,7 +20,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from common import FetchGate, LogCache
+from common import FetchGate, LogCache, apply_forecasts, cache_age_iso
 from urllib.parse import unquote
 
 
@@ -88,106 +88,6 @@ def local_date_from_timestamp(value: Any) -> str:
         return date_string(parsed.date())
     except Exception:
         return date_string(dt.datetime.now().date())
-
-
-def format_hours_duration(hours: float) -> str:
-    """Format duration in hours to compact human readable string (e.g. 45m, 2.5h, 1d 4h)."""
-    if hours <= 0:
-        return "0m"
-    if hours < 1.0:
-        return f"{max(1, round(hours * 60))}m"
-    if hours < 24.0:
-        return f"{hours:.1f}h"
-    days = int(hours // 24)
-    rem_h = int(round(hours % 24))
-    if rem_h >= 24:
-        days += 1
-        rem_h = 0
-    return f"{days}d {rem_h}h" if rem_h > 0 else f"{days}d"
-
-
-def compute_bucket_forecast(
-    remaining_pct: float,
-    burn_rate_pct_per_hour: float,
-    resets_at_str: str,
-) -> tuple[str, str, str]:
-    if not resets_at_str:
-        return "", "No reset time provided", "stable"
-
-    try:
-        resets_at = dt.datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
-        now = dt.datetime.now(dt.timezone.utc)
-        hours_until_reset = max(0.0, (resets_at - now).total_seconds() / 3600.0)
-    except Exception:
-        return "", "Invalid reset time", "stable"
-
-    burn_str = f"{burn_rate_pct_per_hour:.1f}%/h" if burn_rate_pct_per_hour > 0 else ""
-
-    if burn_rate_pct_per_hour <= 0.001 or hours_until_reset <= 0:
-        return burn_str, "Paced to reset", "stable"
-
-    hours_until_depleted = remaining_pct / burn_rate_pct_per_hour
-    depletion_duration_str = format_hours_duration(hours_until_depleted)
-
-    if hours_until_depleted < hours_until_reset:
-        return burn_str, f"Depletes in ~{depletion_duration_str} (before reset)", "critical"
-
-    remaining_at_reset = max(0.0, remaining_pct - (burn_rate_pct_per_hour * hours_until_reset))
-    status = "warning" if remaining_at_reset < 15.0 else "safe"
-    prefix = "Tight pace" if status == "warning" else "On pace"
-    return burn_str, f"{prefix} · ~{remaining_at_reset:.0f}% at reset", status
-
-
-def update_quota_snapshots(base_dir: Path, groups: list[dict[str, Any]]) -> dict[str, float]:
-    snap_file = base_dir / "cache" / "quota_snapshots.json"
-    snap_file.parent.mkdir(parents=True, exist_ok=True)
-    now_ts = time.time()
-
-    snapshots: dict[str, list[tuple[float, float]]] = {}
-    if snap_file.exists():
-        try:
-            with open(snap_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                if isinstance(raw, dict):
-                    snapshots = {k: [(float(t), float(pct)) for t, pct in v] for k, v in raw.items() if isinstance(v, list)}
-        except Exception:
-            snapshots = {}
-
-    burn_rates: dict[str, float] = {}
-
-    for g in groups:
-        for b in g.get("buckets", []):
-            bid = b.get("id") or b.get("name")
-            if not bid:
-                continue
-            rem_pct = float(b.get("remainingPercent", (b.get("remainingFraction", 1.0) * 100)))
-            pts = snapshots.setdefault(bid, [])
-            pts.append((now_ts, rem_pct))
-            cutoff = now_ts - (6 * 3600)
-            pts = [(t, pct) for t, pct in pts if t >= cutoff]
-            snapshots[bid] = pts
-
-            if len(pts) >= 2:
-                t_first, p_first = pts[0]
-                t_last, p_last = pts[-1]
-                time_span_h = (t_last - t_first) / 3600.0
-                if time_span_h >= (3.0 / 60.0):
-                    pct_drop = p_first - p_last
-                    burn_rates[bid] = max(0.0, pct_drop / time_span_h) if pct_drop > 0 else 0.0
-                else:
-                    burn_rates[bid] = 0.0
-            else:
-                burn_rates[bid] = 0.0
-
-    try:
-        tmp_snap = snap_file.with_suffix(".tmp")
-        with open(tmp_snap, "w", encoding="utf-8") as f:
-            json.dump(snapshots, f)
-        tmp_snap.replace(snap_file)
-    except Exception:
-        pass
-
-    return burn_rates
 
 
 def read_configured_model(base_dir: Path | None = None) -> str:
@@ -523,12 +423,18 @@ def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[s
         return cached_groups(str(exc))
 
 
-# Bump when read_update_lines or read_history_lines change what they record.
-LOG_CACHE_VERSION = 1
+# Bump when read_update_lines changes what it records, so caches are rebuilt.
+LOG_CACHE_VERSION = 3
 
 
 def read_update_lines(entry: dict[str, Any], lines: list[bytes], mtime: float) -> None:
-    """Completed turns in one updates.jsonl, as [turns, input, output, cached] by model and day."""
+    """One session's updates.jsonl.
+
+    turns: [prompts, steps, input, output, cached] by model and day. A turn is
+    one prompt; its steps are the model's replies, one per tool call it made
+    plus the final answer. Tool calls carry no timestamp, so they wait in
+    `pending` for the turn that completes them. tools: tool calls by name.
+    """
     for raw in lines:
         try:
             row = json.loads(raw.decode("utf-8", errors="replace"))
@@ -536,35 +442,29 @@ def read_update_lines(entry: dict[str, Any], lines: list[bytes], mtime: float) -
             continue
         params = row.get("params") if isinstance(row, dict) else None
         update = params.get("update") if isinstance(params, dict) else None
-        if not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed":
+        if not isinstance(update, dict):
             continue
-        usage = update.get("usage")
-        if not isinstance(usage, dict):
+        kind = update.get("sessionUpdate")
+        if kind == "tool_call":
+            entry["pending"] += 1
+            name = sanitize_plain_text(str(update.get("title") or "tool").split(":")[0], 50)
+            entry["tools"][name] = entry["tools"].get(name, 0) + 1
             continue
+        if kind != "turn_completed":
+            continue
+        usage = update.get("usage") if isinstance(update.get("usage"), dict) else {}
         meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
-        day = local_date_from_timestamp(meta.get("agentTimestampMs") or row.get("timestamp"))
+        day = local_date_from_timestamp(meta.get("agentTimestampMs") or row.get("timestamp") or mtime)
         models = usage.get("modelUsage") if isinstance(usage.get("modelUsage"), dict) else {}
         m = next(iter(models), None) or "grok-3"
         m = str(m).rstrip("/").split("/")[-1] or "grok-3"
-        counts = entry["turns"].setdefault(m + "\x1f" + day, [0, 0, 0, 0])
+        counts = entry["turns"].setdefault(m + "\x1f" + day, [0, 0, 0, 0, 0])
         counts[0] += 1
-        counts[1] += int(usage.get("inputTokens") or 0)
-        counts[2] += int(usage.get("outputTokens") or 0)
-        counts[3] += int(usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens") or 0)
-
-
-def read_history_lines(entry: dict[str, Any], lines: list[bytes], mtime: float) -> None:
-    """Tool calls in one chat_history.jsonl, by tool name."""
-    for raw in lines:
-        try:
-            row = json.loads(raw.decode("utf-8", errors="replace"))
-        except ValueError:
-            continue
-        if isinstance(row, dict) and row.get("type") == "tool_call":
-            name = row.get("tool_name") or row.get("name")
-            if name:
-                key = sanitize_plain_text(name, 50)
-                entry["tools"][key] = entry["tools"].get(key, 0) + 1
+        counts[1] += entry["pending"] + 1
+        counts[2] += int(usage.get("inputTokens") or 0)
+        counts[3] += int(usage.get("outputTokens") or 0)
+        counts[4] += int(usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens") or 0)
+        entry["pending"] = 0
 
 
 def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
@@ -608,21 +508,21 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
     log_cache = LogCache("grok", LOG_CACHE_VERSION)
     turns: dict[str, list[int]] = {}
     for p in sorted(sessions_dir.glob("*/*/updates.jsonl")) if sessions_dir.exists() else []:
-        entry = log_cache.update(p, lambda: {"turns": {}}, read_update_lines)
-        for key, counts in (entry or {}).get("turns", {}).items():
-            total = turns.setdefault(key, [0, 0, 0, 0])
+        entry = log_cache.update(p, lambda: {"turns": {}, "tools": {}, "pending": 0}, read_update_lines)
+        if entry is None:
+            continue
+        for key, counts in entry["turns"].items():
+            total = turns.setdefault(key, [0, 0, 0, 0, 0])
             for i, n in enumerate(counts):
                 total[i] += n
-    for p in sorted(sessions_dir.glob("*/*/chat_history.jsonl")) if sessions_dir.exists() else []:
-        entry = log_cache.update(p, lambda: {"tools": {}}, read_history_lines)
-        tool_counter.update((entry or {}).get("tools", {}))
+        tool_counter.update(entry["tools"])
     log_cache.prune()
 
-    for key, (count, in_tok, out_tok, cached_tok) in turns.items():
+    for key, (count, steps, in_tok, out_tok, cached_tok) in turns.items():
         m, day = key.split("\x1f", 1)
         total_tok = in_tok + out_tok
         total_prompts += count
-        total_steps += count
+        total_steps += steps
         bucket = model_usage.setdefault(m, {
             "name": m,
             "prompts": 0,
@@ -637,47 +537,29 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
             "color": "#3B82F6",
         })
         bucket["prompts"] += count
-        bucket["steps"] += count
+        bucket["steps"] += steps
         bucket["inputTokens"] += in_tok
         bucket["outputTokens"] += out_tok
         bucket["cachedTokens"] += cached_tok
         if day in recent_days_map:
             recent_days_map[day]["messageCount"] += count
             recent_days_map[day]["prompts"] += count
-            recent_days_map[day]["steps"] += count
+            recent_days_map[day]["steps"] += steps
             bucket["weekPrompts"] += count
-            bucket["weekSteps"] += count
+            bucket["weekSteps"] += steps
         if day == today_str:
             today_prompts += count
-            today_steps += count
+            today_steps += steps
             today_tokens += total_tok
             today_cached += cached_tok
             bucket["todayPrompts"] += count
-            bucket["todaySteps"] += count
+            bucket["todaySteps"] += steps
             today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + total_tok
             today_cached_by_model[m] = today_cached_by_model.get(m, 0) + cached_tok
 
     # 3. Fetch billing limits
     groups, tier, err_str = fetch_grok_billing(base_dir, force=force)
-    burn_rates = update_quota_snapshots(base_dir, groups)
-
-    limits_list = []
-    for g in groups:
-        for b in g.get("buckets", []):
-            bid = b.get("id") or b.get("name")
-            rem_pct = float(b.get("remainingPercent", 100))
-            rate = burn_rates.get(bid, 0.0)
-            burn_txt, fc_txt, status = compute_bucket_forecast(rem_pct, rate, b.get("resetTime", ""))
-            b["burnRatePerHour"] = rate
-            b["burnRateText"] = burn_txt
-            b["forecastText"] = fc_txt
-            b["forecastStatus"] = status
-
-            limits_list.append({
-                "label": b.get("label", "Limit"),
-                "percent": float(b.get("usedPercent", 0)) / 100.0,
-                "resetsAt": b.get("resetTime", ""),
-            })
+    limits_list = apply_forecasts("grok", groups)
 
 
     model_list = list(model_usage.values())
@@ -691,7 +573,7 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
         "tierLabel": tier if tier else "xAI",
         "currentModel": read_configured_model(base_dir) or next((x.get("model") for x in sessions if x.get("model")), ""),
         "todayPrompts": today_prompts,
-        "todaySessions": len(res["activeSessions"]) if has_active else (1 if today_prompts > 0 else 0),
+        "todaySessions": sum(1 for s in sessions if local_date_from_timestamp(s.get("updated_at")) == today_str),
         "todaySteps": today_steps,
         "todayTotalTokens": today_tokens,
         "todayCachedTokens": today_cached,
@@ -707,8 +589,9 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
         "quotaGroups": groups,
         "limits": limits_list,
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "quotaUpdatedAt": dt.datetime.now(dt.timezone.utc).isoformat() if groups else "",
-        "quotaUpdatedMs": round(time.time() * 1000) if groups else 0,
+        # Served from cache after a failed request: say how old, and why.
+        "quotaError": err_str,
+        "quotaUpdatedAt": (cache_age_iso(base_dir / "cache" / "quota_usage_cache.json") if err_str else dt.datetime.now(dt.timezone.utc).isoformat()) if groups else "",
         "lastFullRefreshMs": round(time.time() * 1000),
         "usageStatusText": "" if has_stats else "No Grok activity found",
         "authHelpText": "" if has_stats else "Run `grok login` to begin.",

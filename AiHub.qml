@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Effects
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -34,6 +33,8 @@ BarWidget {
     var keys = pageKeys.filter(function(key) { return root.tabShown(key) })
     return keys.length > 0 ? keys : ["usage"]
   }
+  // Usage is on the bar: its tab, dots and badge all follow this one rule.
+  readonly property bool usageShown: visibleKeys.indexOf("usage") >= 0
 
   // The Local page's servers, saved under `local`.
   readonly property var localSettings: pageSettings("local")
@@ -42,6 +43,12 @@ BarWidget {
 
   property string currentKey: "usage"
   property bool popupOpen: false
+  // What the shell's panel routing reads (summon hotkeys, Tab between bar
+  // panels, closing on a bar drag); a widget without it is not a panel.
+  readonly property bool opened: popupOpen
+  // The output this bar is on, so script commands reach the focused one.
+  readonly property string screenName: button.QsWindow.window && button.QsWindow.window.screen
+    ? String(button.QsWindow.window.screen.name || "") : ""
   property bool popoutSwitchClosing: false
   property bool switching: false
   property var panels: ({})
@@ -277,7 +284,7 @@ BarWidget {
 
   // Blink phase for the dots of busy providers.
   property bool dotPhase: true
-  readonly property bool anyBusy: !!usagePage && tabShown("usage")
+  readonly property bool anyBusy: !!usagePage && usageShown
     && usagePage.allProviders.some(function(p) { return p.agentEnabled && p.hasActiveSession && p.busy })
   Timer {
     interval: 1000
@@ -310,7 +317,7 @@ BarWidget {
 
     Loader {
       id: usageLoader
-      active: root.tabShown("usage") || root.visibleKeys[0] === "usage"
+      active: root.usageShown
       onActiveChanged: if (!active) root.unregisterPanel("usage")
       sourceComponent: Component { Usage.Widget { bar: usageBar; settings: root.pageSettings("usage") } }
     }
@@ -340,23 +347,6 @@ BarWidget {
     }
   }
 
-  IpcHandler {
-    target: "design-nexus.ai-hub"
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
-    function page(name: string): string {
-      var key = name === "lmstudio" || name === "ollama" ? "local" : name
-      if (key === "settings") { root.showPage(key); return "ok" }
-      if (root.visibleKeys.indexOf(key) < 0) return "unknown or hidden page: " + name + " (" + root.visibleKeys.join(", ") + ", settings)"
-      root.showPage(key)
-      return "ok"
-    }
-    function refresh(): string { root.refreshAll(); return "ok" }
-    function current(): string { return root.popupOpen ? root.currentKey : "closed" }
-  }
 
   // ------------------------------------------------------------ bar button
 
@@ -412,7 +402,7 @@ BarWidget {
         // while that provider is busy. Stepped by a 1 s timer rather than a
         // fade, so the bar redraws twice a second instead of every frame.
         Repeater {
-          model: root.usagePage && root.tabShown("usage") ? root.usagePage.allProviders : []
+          model: root.usagePage && root.usageShown ? root.usagePage.allProviders : []
           delegate: Rectangle {
             required property var modelData
             required property int index
@@ -434,7 +424,7 @@ BarWidget {
         anchors.verticalCenter: parent.verticalCenter
         visible: text !== ""
         textFormat: Text.PlainText
-        text: root.usagePage && root.tabShown("usage") ? root.usagePage.badgeText : ""
+        text: root.usagePage && root.usageShown ? root.usagePage.badgeText : ""
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -478,7 +468,7 @@ BarWidget {
     contentWidth: panel.fittedContentWidth(Math.max(Style.space(390),
       tabSizer.implicitWidth + settingsButton.width + Style.space(12) * 3 + root.borderInsetH))
     contentHeight: root.borderInsetV + tabRow.height
-      + (root.settingsShown ? settingsView.implicitHeight
+      + (root.settingsShown ? Math.min(settingsView.implicitHeight, root.availablePageHeight)
         : (root.activePanelShown ? root.activePanel.contentHeight : placeholder.implicitHeight))
 
     // Page switching that works whatever the page does with its own keys.
@@ -500,10 +490,12 @@ BarWidget {
         model: 5
         delegate: Item {
           required property int index
+          // Enabled past the last visible tab too, so Alt+5 with four tabs
+          // does nothing rather than reaching the page as a 5.
           Shortcut {
             sequence: "Alt+" + (index + 1)
-            enabled: root.popupOpen && index < root.visibleKeys.length
-            onActivated: root.showPage(root.visibleKeys[index])
+            enabled: root.popupOpen
+            onActivated: if (index < root.visibleKeys.length) root.showPage(root.visibleKeys[index])
           }
         }
       }
@@ -603,13 +595,24 @@ BarWidget {
           }
         }
 
-        HubSettings {
-          id: settingsView
+        // Scrolls rather than growing past the screen the panel is on.
+        Flickable {
+          id: settingsFlick
           visible: root.settingsShown
           width: parent.width
-          hub: root
-          foreground: Commons.Color.foreground
-          fontFamily: root.fontFamily
+          height: Math.min(settingsView.implicitHeight, parent.height)
+          contentWidth: width
+          contentHeight: settingsView.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+
+          HubSettings {
+            id: settingsView
+            width: settingsFlick.width
+            hub: root
+            foreground: Commons.Color.foreground
+            fontFamily: root.fontFamily
+          }
         }
       }
     }

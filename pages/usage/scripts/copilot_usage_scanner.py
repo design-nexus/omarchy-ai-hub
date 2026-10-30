@@ -175,11 +175,11 @@ def quota_from_copilot_user(payload: dict) -> tuple[list[dict], str]:
     return [{"name": "Copilot", "buckets": buckets}], tier
 
 
-def fetch_copilot_quota(home: Path) -> tuple[list[dict], str, str]:
+def fetch_copilot_quota(home: Path, force: bool = False) -> tuple[list[dict], str, str]:
     if os.environ.get("COPILOT_USAGE_SKIP_QUOTA") == "1":
         return [], "", ""
     cache = home / "cache" / "quota_usage_cache.json"
-    if cache.exists():
+    if cache.exists() and not force:
         try:
             if time_age(cache) < 180:
                 cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -190,7 +190,7 @@ def fetch_copilot_quota(home: Path) -> tuple[list[dict], str, str]:
             pass
     # Also spares `gh auth token` (a process per run) while quota is failing.
     gate = FetchGate("copilot")
-    blocked = gate.blocked()
+    blocked = gate.blocked(force)
     if blocked:
         return [], "", blocked
     token = github_token()
@@ -262,6 +262,8 @@ def read_events(home: Path) -> tuple[dict[str, dict], Counter, int, dict]:
                 try:
                     event = json.loads(line)
                 except ValueError:
+                    continue
+                if not isinstance(event, dict):
                     continue
                 data = event.get("data") if isinstance(event.get("data"), dict) else {}
                 kind = str(event.get("type") or "")
@@ -421,7 +423,7 @@ def apply_metrics(session: dict, models: dict[str, dict], today: dt.date, week: 
         row["steps"] += max(count, 1 if (input_tokens or output_tokens) else 0)
 
 
-def apply_usage_rows(rows: list, sessions: dict[str, dict], models: dict[str, dict], today: dt.date, week: set[str]) -> set[str]:
+def apply_usage_rows(rows: list, sessions: dict[str, dict], models: dict[str, dict], daily_steps: Counter, today: dt.date, week: set[str]) -> set[str]:
     seen = set()
     for session_id, model, input_tokens, output_tokens, cache_read, cache_write, created_at in rows:
         seen.add(str(session_id))
@@ -436,6 +438,7 @@ def apply_usage_rows(rows: list, sessions: dict[str, dict], models: dict[str, di
         row["cachedTokens"] += cached
         row["steps"] += 1
         when = local_day(stamp(created_at)) or today
+        daily_steps[str(when)] += 1
         if when == today:
             row["todaySteps"] += 1
             row["todayTokens"] += fresh
@@ -447,6 +450,18 @@ def apply_usage_rows(rows: list, sessions: dict[str, dict], models: dict[str, di
         session["model"] = session["model"] or name
         session["updated_ts"] = max(session["updated_ts"], stamp(created_at))
     return seen
+
+
+def add_steps(model: str, days: list[dt.date], models: dict[str, dict], daily_steps: Counter, today: dt.date, week: set[str]) -> None:
+    row = models.setdefault(model, blank_model(model))
+    for day in days:
+        key = str(day)
+        row["steps"] += 1
+        daily_steps[key] += 1
+        if day == today:
+            row["todaySteps"] += 1
+        if key in week:
+            row["weekSteps"] += 1
 
 
 def add_prompts(model: str, days: list[dt.date], models: dict[str, dict], daily_prompts: Counter, daily_steps: Counter, today: dt.date, week: set[str]) -> None:
@@ -461,16 +476,16 @@ def add_prompts(model: str, days: list[dt.date], models: dict[str, dict], daily_
             row["weekPrompts"] += 1
 
 
-def scan(home: Path) -> dict:
+def scan(home: Path, force: bool = False) -> dict:
     today = dt.date.today()
     week = {str(today - dt.timedelta(days=i)) for i in range(7)}
     sessions, tools, premium, code = read_events(home)
     usage_rows = read_database(home, sessions, tools)
     read_legacy(home, sessions)
     models: dict[str, dict] = {}
-    token_sessions = apply_usage_rows(usage_rows, sessions, models, today, week)
     daily_prompts: Counter = Counter()
     daily_steps: Counter = Counter()
+    token_sessions = apply_usage_rows(usage_rows, sessions, models, daily_steps, today, week)
     visible = []
     for session in sessions.values():
         if session["child"]:
@@ -481,12 +496,9 @@ def scan(home: Path) -> dict:
         if session["prompts"]:
             days = session["promptDays"] or [local_day(session["updated_ts"]) or today]
             add_prompts(model, days, models, daily_prompts, daily_steps, today, week)
-            row = models[model]
-            if row["steps"] < row["prompts"]:
-                row["steps"] = row["prompts"]
-                row["todaySteps"] = max(row["todaySteps"], row["todayPrompts"])
-                row["weekSteps"] = max(row["weekSteps"], row["weekPrompts"])
-                daily_steps[str(days[-1])] += session["prompts"]
+            # Without recorded model calls, each prompt took at least one step.
+            if session["conversationId"] not in token_sessions:
+                add_steps(model, days, models, daily_steps, today, week)
         elif session["requestCounts"]:
             for name, count in session["requestCounts"].items():
                 when = local_day(session["updated_ts"]) or today
@@ -526,7 +538,7 @@ def scan(home: Path) -> dict:
             "steps": daily_steps[day],
         })
     has_stats = bool(visible) or bool(daily_prompts) or total_tokens > 0
-    groups, tier, quota_error = fetch_copilot_quota(home)
+    groups, tier, quota_error = fetch_copilot_quota(home, force)
     return {
         "ready": True,
         "active": active,
@@ -554,6 +566,7 @@ def scan(home: Path) -> dict:
         "modelList": model_list,
         "quotaGroups": groups,
         "quotaNote": "" if groups else (quota_error or QUOTA_NOTE),
+        "quotaError": quota_error,
         "limits": [],
         "recentWorkspaces": [],
         "premiumRequests": premium,
@@ -568,7 +581,7 @@ def scan(home: Path) -> dict:
 
 def collect(force: bool = False) -> dict:
     """This provider's usage, for usage_scanner.py to call in-process."""
-    return scan(HOME)
+    return scan(HOME, force=force)
 
 
 def main() -> None:

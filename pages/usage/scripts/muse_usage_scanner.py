@@ -84,6 +84,10 @@ def blank_session(session_id: str) -> dict:
         "isActive": False,
         "prompts": 0,
         "promptDay": None,
+        # Prompts and steps by the local day they happened ("" when the record
+        # had no time), so a session spanning days counts on each of them.
+        "dayPrompts": {},
+        "daySteps": {},
     }
 
 
@@ -171,6 +175,11 @@ def text_of(blocks) -> str:
     return ""
 
 
+def bump(counts: dict, when: float) -> None:
+    key = str(local_day(when) or "")
+    counts[key] = counts.get(key, 0) + 1
+
+
 def read_transcript(path: Path, session: dict, tools: Counter, today: dt.date) -> None:
     try:
         handle = path.open(encoding="utf-8", errors="replace")
@@ -220,11 +229,13 @@ def read_transcript(path: Path, session: dict, tools: Counter, today: dt.date) -
                     if tool:
                         tools[tool] += 1
                         session["steps"] = session.get("steps", 0) + 1
+                        bump(session["daySteps"], when)
                 elif payload_type == "runtime.session":
                     event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
                     kind = event.get("kind")
                     if kind == "started" and isinstance(event.get("prompt"), str) and event["prompt"].strip():
                         session["prompts"] += 1
+                        bump(session["dayPrompts"], when)
                         if not session["preview"]:
                             session["preview"] = clip(event["prompt"])
                         day = local_day(when)
@@ -233,6 +244,7 @@ def read_transcript(path: Path, session: dict, tools: Counter, today: dt.date) -
                             session["lastPromptTs"] = when
                     elif kind in ("assistant_message_committed", "assistant_tool_calls_committed"):
                         session["steps"] = session.get("steps", 0) + 1
+                        bump(session["daySteps"], when)
     try:
         mtime = path.stat().st_mtime
     except OSError:
@@ -250,20 +262,31 @@ def account_prompts(session: dict, models: dict[str, dict], daily_prompts: Count
         session["promptDay"] = session["promptDay"] or local_day(session["updated_ts"]) or today
     model = session["model"] or "Unknown"
     row = models.setdefault(model, blank_model(model))
-    day = session["promptDay"] or today
-    key = str(day)
-    steps = max(int(session.get("steps") or 0), count)
-    row["prompts"] += count
-    row["steps"] += steps
-    daily_prompts[key] += count
-    daily_steps[key] += steps
-    if day == today:
-        row["todayPrompts"] += count
-        row["todaySteps"] += steps
-    if key in week:
-        row["weekPrompts"] += count
-        row["weekSteps"] += steps
-    session["stepCount"] = steps
+    fallback = str(session["promptDay"] or local_day(session["updated_ts"]) or today)
+    by_day: dict[str, list[int]] = {}
+    for key, n in (session.get("dayPrompts") or {}).items():
+        by_day.setdefault(key or fallback, [0, 0])[0] += n
+    for key, n in (session.get("daySteps") or {}).items():
+        by_day.setdefault(key or fallback, [0, 0])[1] += n
+    if not by_day:
+        # Known only from the index: every prompt on the session's last day.
+        by_day[fallback] = [count, int(session.get("steps") or 0)]
+    total_steps = 0
+    for key, (prompts, steps) in by_day.items():
+        # Each prompt took at least one step.
+        steps = max(steps, prompts)
+        total_steps += steps
+        row["prompts"] += prompts
+        row["steps"] += steps
+        daily_prompts[key] += prompts
+        daily_steps[key] += steps
+        if key == str(today):
+            row["todayPrompts"] += prompts
+            row["todaySteps"] += steps
+        if key in week:
+            row["weekPrompts"] += prompts
+            row["weekSteps"] += steps
+    session["stepCount"] = total_steps
 
 
 def scan(data_home: Path) -> dict:
@@ -278,7 +301,8 @@ def scan(data_home: Path) -> dict:
     store = data_home / "sessions"
     transcripts: list[Path] = []
     if store.exists():
-        transcripts = sorted(store.glob("*/*/*/*/session.jsonl"))
+        # Paths are YEAR/MONTH/DAY/<id>: newest first, so the cap drops the oldest.
+        transcripts = sorted(store.glob("*/*/*/*/session.jsonl"), reverse=True)
     for path in transcripts[:400]:
         try:
             sid = path.parent.name
@@ -307,7 +331,7 @@ def scan(data_home: Path) -> dict:
             session["preview"] = session["title"]
         if session["updated_ts"]:
             session["updated_at"] = dt.datetime.fromtimestamp(session["updated_ts"]).isoformat()
-        for key in ("promptDay", "prompts", "steps", "updated_ts", "lastPromptTs", "indexPrompts", "logPath", "_hasLog"):
+        for key in ("promptDay", "prompts", "steps", "updated_ts", "lastPromptTs", "indexPrompts", "logPath", "_hasLog", "dayPrompts", "daySteps"):
             session.pop(key, None)
         visible.append(session)
     cwds = muse_active_cwds()

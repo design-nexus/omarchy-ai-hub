@@ -224,7 +224,7 @@ Panel {
   // them is a thing to go looking for in an inherited PATH.
   readonly property string scanScript:
       "set -m\n"
-    + "\"$1\" \"$2\" scan --divisor \"$3\" | { head -c \"$4\"; cat >/dev/null; } &\n"
+    + "\"$1\" \"$2\" scan --divisor \"$3\" --deadline 6 | { head -c \"$4\"; cat >/dev/null; } &\n"
     + "trap 'kill -TERM %1 2>/dev/null; exit 143' TERM INT\n"
     + "wait %1\n"
 
@@ -645,8 +645,11 @@ Panel {
     root.startScan()
   }
 
+  property double lastScanStartMs: 0
+
   function startScan() {
     if (scanProc.running) return
+    root.lastScanStartMs = Date.now()
     root.scanning = true
     root.scanConsumed = false
     root.scanError = ""
@@ -2800,7 +2803,9 @@ Panel {
     // scanOnOpen off means the cached scan is reused; it is still refreshed
     // behind the list once it is older than its lifetime, which is what the
     // setting's own description promises.
-    if (root.scanOnOpen || !root.loaded) root.startScan()
+    // The hub reopens a page on every tab switch; a scan from the last minute
+    // is still what is on disk.
+    if (!root.loaded || (root.scanOnOpen && Date.now() - root.lastScanStartMs > 60000)) root.startScan()
     else root.requestScan(false)
   }
 

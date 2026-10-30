@@ -49,7 +49,7 @@ FocusScope {
   focus: true
 
   Keys.onPressed: function(event) {
-    if (event.key === Qt.Key_Escape) hub.close()
+    if (event.key === Qt.Key_Escape || event.text === "q") hub.close()
     else if (event.key === Qt.Key_Tab) hub.cyclePage(1)
     else if (event.key === Qt.Key_Backtab) hub.cyclePage(-1)
     else if (event.key === Qt.Key_Down || event.text === "j") cursor = Math.min(rows.length - 1, cursor + 1)

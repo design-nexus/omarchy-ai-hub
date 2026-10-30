@@ -3,7 +3,6 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -310,11 +309,10 @@ BarWidget {
       : (next.showBadge === false ? "off" : "active")
     if (bm !== "active" && bm !== "prompts" && bm !== "off") bm = "active"
     next.badgeMode = bm
-    next.showBadge = bm !== "off"
-
-    next.enableQuotaAlerts = next.enableQuotaAlerts !== false
-    var thresh = Number(next.quotaAlertThreshold === undefined || next.quotaAlertThreshold === null ? 15 : next.quotaAlertThreshold)
-    next.quotaAlertThreshold = Math.round(clamp(isFinite(thresh) ? thresh : 15, 5, 50))
+    // Superseded or removed settings, dropped on the next save.
+    delete next.showBadge
+    delete next.enableQuotaAlerts
+    delete next.quotaAlertThreshold
 
     next.terminalCommand = next.terminalCommand ? String(next.terminalCommand).trim() : ""
 
@@ -341,23 +339,15 @@ BarWidget {
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
   }
 
-  function applySettings(next) {
-    var n = normalizedSettings(next)
-    root.settings = n
-    root.draftSettings = n
-  }
-
+  // Saved through the hub into shell.json; `settings` comes back from there
+  // through the hub's binding, which assigning it here would cut.
   function persistSettings(next) {
-    applySettings(next)
-    var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : []
-    for (var i = 0; i < items.length; i++) {
-      if (items[i] && items[i] !== root && typeof items[i].applySettings === "function") items[i].applySettings(next)
-    }
-    if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function") {
-      bar.shell.updateEntryInline(root.moduleName, root.settings)
+    var n = normalizedSettings(next)
+    root.draftSettings = n
+    if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function" && bar.shell.updateEntryInline(root.moduleName, n)) {
       settingsStatusText = "Saved to shell.json"
     } else {
-      settingsStatusText = "Saved for this session"
+      settingsStatusText = "Could not save to shell.json"
     }
   }
 
@@ -375,7 +365,9 @@ BarWidget {
 
   // Every control saves immediately; there is no separate Save step.
   function updateSetting(name, value) {
-    var next = normalizedSettings(root.settings)
+    // The draft, not `settings`: a second change can land before the first
+    // has come back from shell.json.
+    var next = normalizedSettings(root.draftSettings)
     next[name] = value
     persistSettings(normalizedSettings(next))
     if (agentSettingKeys.indexOf(name) !== -1) {
@@ -430,40 +422,6 @@ BarWidget {
     id: killRefreshTimer
     interval: 350
     onTriggered: root.triggerRefresh(false)
-  }
-
-  IpcHandler {
-    target: "design-nexus.ai-usage"
-    function open(): string {
-      root.showUsage()
-      root.popupOpen = true
-      root.triggerRefresh(false)
-      return "ok"
-    }
-    function close(): string { root.close(); return "ok" }
-    function toggle(): string {
-      if (root.popupOpen) {
-        root.close()
-      } else {
-        root.showUsage()
-        root.popupOpen = true
-        root.triggerRefresh(false)
-      }
-      return "ok"
-    }
-    function refresh(): string { root.triggerRefresh(false); return "ok" }
-    function settings(): string { root.openSettings(); return "ok" }
-    function openSettings(): string { root.openSettings(); return "ok" }
-    function select(id: string): string {
-      var provider = usageMain.providerFor(id)
-      if (!provider) return "unknown or disabled agent: " + id
-      root.selectProvider(provider.providerId)
-      return "ok"
-    }
-    function setBadgeMode(mode: string): string {
-      root.updateSetting("badgeMode", mode)
-      return "ok"
-    }
   }
 
   // ------------------------------------------------------------ Bar chip
@@ -606,7 +564,9 @@ BarWidget {
       }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { if (root.bar) root.bar.switchPanelFrom(root, direction) }
-      onTextKey: function(t) {
+      onTextKey: function(t, modifiers) {
+        // Alt and Ctrl chords belong to the hub (Alt+1..5 switch tabs), not to page keys.
+        if (modifiers & (Qt.AltModifier | Qt.ControlModifier)) return
         var k = t.toLowerCase()
         if (k === "r") root.triggerRefresh(true)
         else if (k === "s") root.settingsMode ? root.showUsage() : root.openSettings()
@@ -1187,7 +1147,15 @@ BarWidget {
 
     CardEmpty {
       visible: quotaCard.groups.length === 0
-      text: (provider && provider.quotaNote) || "This agent does not report a remaining allowance."
+      text: (provider && (provider.quotaNote || provider.quotaError)) || "This agent does not report a remaining allowance."
+    }
+
+    MetaText {
+      visible: quotaCard.groups.length > 0 && !!provider && provider.quotaError !== ""
+      Layout.fillWidth: true
+      wrapMode: Text.WordWrap
+      color: root.warn
+      text: provider ? "Updated " + (root.formatAge(provider.quotaUpdatedMs) || "earlier") + ". " + provider.quotaError : ""
     }
 
     Repeater {
@@ -1677,7 +1645,6 @@ BarWidget {
 
     readonly property bool editorActive: Boolean(
       (refreshIntervalField.field && refreshIntervalField.field.activeFocus)
-      || (alertThresholdField.field && alertThresholdField.field.activeFocus)
       || (recentSessionsLimitField.field && recentSessionsLimitField.field.activeFocus)
       || terminalField.activeFocus
     )
@@ -1750,35 +1717,6 @@ BarWidget {
           target: root
           function onDraftSettingsChanged() { badgeModeButtonGroup.value = String(root.draftValue("badgeMode", "active")) }
         }
-      }
-    }
-
-    SectionCard {
-      title: "Low Quota Alerts"
-      subtitle: "Desktop notification when a reported allowance drops below the threshold."
-
-      SettingRow {
-        label: "Enable alerts"
-        ToggleSwitch {
-          checked: root.draftValue("enableQuotaAlerts", true) !== false
-          onToggled: root.updateSetting("enableQuotaAlerts", !checked)
-        }
-      }
-
-      NumberField {
-        id: alertThresholdField
-        label: "Threshold (% remaining)"
-        value: Number(root.draftValue("quotaAlertThreshold", 15))
-        from: 5
-        to: 50
-        stepSize: 5
-        fieldWidth: parent.width
-        foreground: root.foreground
-        accent: root.accent
-        fontFamily: root.fontFamily
-        enabled: root.draftValue("enableQuotaAlerts", true) !== false
-        opacity: enabled ? 1.0 : 0.45
-        onModified: function(value) { root.updateSetting("quotaAlertThreshold", value) }
       }
     }
 

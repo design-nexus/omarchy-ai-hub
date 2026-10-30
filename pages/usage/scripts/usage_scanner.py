@@ -154,6 +154,15 @@ def merge_xsi(force):
     newest = sessions[0]["source"] if sessions else parts[0][0]
     _, newest_exe, newest_part = by_source[newest]
     quota = next((part for _, _, _, part in parts if part.get("quotaGroups")), None)
+    quota_groups = list(quota.get("quotaGroups") or []) if quota else []
+    # Cursor's allowance for models picked by name (and on-demand spend) is its
+    # own; only its Auto pool is the one Grok's billing already shows.
+    cursor_part = by_source.get("cursor", (None, None, {}))[2]
+    if quota is not None and quota is not cursor_part:
+        own = [b for g in cursor_part.get("quotaGroups") or [] for b in g.get("buckets") or []
+               if b.get("id") in ("cursor-api", "cursor-on-demand")]
+        if own:
+            quota_groups.append({"name": "Cursor API", "color": "#f54e00", "buckets": own})
     active = any(part.get("hasActiveSession") for _, _, _, part in parts)
     has_stats = any(part.get("hasLocalStats") for _, _, _, part in parts)
     now = dt.datetime.now(dt.timezone.utc)
@@ -175,7 +184,8 @@ def merge_xsi(force):
         "toolUsage": dict(tools.most_common(12)),
         "modelUsage": {m.get("name"): m for m in model_list},
         "modelList": model_list,
-        "quotaGroups": quota.get("quotaGroups") if quota else [],
+        "quotaGroups": quota_groups,
+        "quotaError": (quota.get("quotaError") or "") if quota else "",
         "limits": (quota.get("limits") or []) if quota else [],
         "quotaUpdatedAt": (quota.get("quotaUpdatedAt") or "") if quota else "",
         "quotaUpdatedMs": (quota.get("quotaUpdatedMs") or 0) if quota else 0,

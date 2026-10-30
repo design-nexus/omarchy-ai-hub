@@ -22,7 +22,9 @@ Panel {
   property bool scanning: false
   property bool scanLimited: false
   property string scanNotice: ""
-  property bool confirmingDelete: false
+  // The session `d` was pressed on once; a second `d` deletes only that one.
+  property string confirmDeleteKey: ""
+  readonly property bool confirmingDelete: confirmDeleteKey !== "" && sessionKey(selected()) === confirmDeleteKey
   property int copiedIndex: -1
   // Rows slide under a stationary cursor while the panel animates open;
   // only treat hover as selection when the pointer itself has moved.
@@ -34,13 +36,13 @@ Panel {
   property bool hoverArmed: false
 
   onSelectedIndexChanged: {
-    root.confirmingDelete = false
+    root.confirmDeleteKey = ""
     if (typeof sessionList !== "undefined" && sessionList.count > 0)
       sessionList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
-  onFilterChanged: root.confirmingDelete = false
+  onFilterChanged: root.confirmDeleteKey = ""
 
-  readonly property string helper: Qt.resolvedUrl("list-sessions").toString().replace(/^file:\/\//, "")
+  readonly property string helper: decodeURIComponent(Qt.resolvedUrl("list-sessions").toString().replace(/^file:\/\//, ""))
   readonly property color fg: root.bar ? root.bar.foreground : Commons.Color.foreground
   readonly property color dimmed: Qt.darker(fg, 1.4)
   readonly property color faint: Qt.darker(fg, 1.9)
@@ -69,6 +71,7 @@ Panel {
 
   function refresh() {
     root.selectedIndex = 0
+    root.confirmDeleteKey = ""
     if (!listProc.running) {
       root.scanLimited = false
       root.scanNotice = ""
@@ -100,12 +103,15 @@ Panel {
     return root.shown.length > 0 ? root.shown[root.selectedIndex] : null
   }
 
+  function sessionKey(s) { return s ? s.agent + "\u0000" + s.id : "" }
+
   function runAction(action, s) {
     if (!s || actionProc.running) return
     if (action === "delete" && !s.canDelete) return
     if (action === "peek" && !s.canPeek) return
     actionProc.pendingRefresh = (action === "delete")
-    actionProc.command = ["python3", root.helper, action, s.agent, String(s.id)]
+    actionProc.action = action
+    actionProc.command = ["/usr/bin/python3", root.helper, action, s.agent, String(s.id)]
     actionProc.running = true
     if (action === "copy") {
       root.copiedIndex = root.selectedIndex
@@ -118,10 +124,10 @@ Panel {
     var s = selected()
     if (!s || !s.canDelete) return
     if (!root.confirmingDelete) {
-      root.confirmingDelete = true
+      root.confirmDeleteKey = sessionKey(s)
       return
     }
-    root.confirmingDelete = false
+    root.confirmDeleteKey = ""
     runAction("delete", s)
   }
 
@@ -167,14 +173,24 @@ Panel {
   Process {
     id: actionProc
     property bool pendingRefresh: false
+    property string action: ""
     onRunningChanged: running ? actionDeadline.restart() : actionDeadline.stop()
-    onExited: if (pendingRefresh) { pendingRefresh = false; root.refresh() }
+    onExited: function(exitCode) {
+      // The helper exits 3 when the session is no longer there.
+      if (exitCode === 3) {
+        root.scanNotice = "That session is gone; rescanning"
+        pendingRefresh = true
+      } else if (exitCode !== 0) {
+        root.scanNotice = "Could not " + (action === "peek" ? "peek at" : action) + " that session"
+      }
+      if (pendingRefresh) { pendingRefresh = false; root.refresh() }
+    }
   }
 
   Process {
     id: listProc
     property bool timedOut: false
-    command: ["python3", root.helper]
+    command: ["/usr/bin/python3", root.helper]
     onRunningChanged: running ? scanDeadline.restart() : scanDeadline.stop()
     onExited: root.scanning = false
     stdout: StdioCollector {
@@ -195,6 +211,9 @@ Panel {
           root.agents = parsed.agents || []
           root.scanLimited = parsed.limited === true
           root.scanNotice = root.scanLimited ? "Partial results · scan limit reached" : ""
+          // A filter on an agent that has no sessions left would show an empty list.
+          if (root.filter !== "all" && !root.agents.some(function(a) { return a.agent === root.filter }))
+            root.filter = "all"
         } catch (e) {
           root.sessions = []
           root.agents = []
@@ -228,9 +247,13 @@ Panel {
           root.selectedIndex = Math.max(0, Math.min(root.shown.length - 1, root.selectedIndex + dy))
         if (dx !== 0) root.cycleFilter(dx)
       }
+      // Enter fires both returnRequested and activateRequested, and Space fires
+      // activateRequested alone: resume on Enter only.
       onReturnRequested: root.resumeSelected()
-      onActivateRequested: root.resumeSelected()
-      onTextKey: function(text) {
+      onDeleteRequested: root.requestDelete()
+      onTextKey: function(text, modifiers) {
+        // Alt and Ctrl chords belong to the hub (Alt+1..5 switch tabs), not to page keys.
+        if (modifiers & (Qt.AltModifier | Qt.ControlModifier)) return
         if (text === "r") root.refresh()
         else if (text === "p") root.runAction("peek", root.selected())
         else if (text === "o") root.runAction("folder", root.selected())

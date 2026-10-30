@@ -33,6 +33,8 @@ Item {
     if (!/^https?:\/\//.test(url)) url = "http://" + url
     return url.replace(/\/+$/, "")
   }
+  // Start and stop act on this machine's ollama, so only for a local address.
+  readonly property bool isLocal: /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/.test(hostUrl)
   readonly property string ctl: Qt.resolvedUrl("bin/ollama-ctl").toString().replace(/^file:\/\//, "")
 
   // Ollama is installed when its CLI is here, or when a server answers anyway
@@ -138,6 +140,7 @@ Item {
 
   function markServerUp(text) {
     serverRunning = true
+    lastError = ""
     if (_desiredServerState === 1) _desiredServerState = -1
     try { version = String(JSON.parse(text).version || "") } catch (e) { version = "" }
     statusText = "Connected (port " + serverPort + ")"
@@ -146,20 +149,20 @@ Item {
   }
 
   function toggleServer() {
-    if (!installed) return
+    if (!installed || !isLocal) return
     if (active) stopServer()
     else startServer()
   }
 
   function startServer() {
-    if (!cliFound || actionProcess.running) return
+    if (!cliFound || !isLocal || actionProcess.running) return
     _desiredServerState = 1
     startWait.restart()
     runAction(["start"], "Starting server…")
   }
 
   function stopServer() {
-    if (!cliFound || actionProcess.running) return
+    if (!cliFound || !isLocal || actionProcess.running) return
     _desiredServerState = 0
     runAction(["stop"], "Stopping server…")
   }
@@ -322,7 +325,9 @@ Item {
     stdout: StdioCollector { id: psStdout; waitForEnd: true }
     stderr: StdioCollector { id: psStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (!root.serverRunning) return
       if (exitCode === 0) {
+        root.lastError = ""
         var parsed = Model.parseOllamaPs(psStdout.text, root.modelInfo)
         root.models = parsed
         root.modelCount = parsed.length
@@ -336,7 +341,7 @@ Item {
     id: tagsProcess
     stdout: StdioCollector { id: tagsStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode !== 0) return
+      if (exitCode !== 0 || !root.serverRunning) return
       var parsed = Model.parseOllamaTags(tagsStdout.text)
       root.availableModels = parsed.options
       root.modelInfo = parsed.info

@@ -81,7 +81,9 @@ Column {
     take()
     focusSection = "models"
     modelIndex = Math.max(0, Math.min(index, svc.models.length - 1))
-    if (modelIndex < modelColumn.children.length) scrollRequested(modelColumn.children[modelIndex])
+    // The Repeater is modelColumn's first child, so the cards sit one past their index there.
+    var card = modelRepeater.itemAt(modelIndex)
+    if (card) scrollRequested(card)
   }
 
   function setActionCursor(index) {
@@ -150,10 +152,13 @@ Column {
     else if (actionIndex === quitSlot && hasQuit) svc.quitApp()
   }
 
+  // Keys that change or copy something act only where the cursor was put:
+  // `s` on a section you moved to, `u`/`c`/`i` on a model row. Right after
+  // opening, a stray key must not stop a server or unload a model.
   function textKey(t) {
     var k = String(t || "").toLowerCase()
-    var m = selectedModel()
-    if (k === "s") svc.toggleServer()
+    var m = cursorActive && focusSection === "models" ? selectedModel() : null
+    if (k === "s") { if (cursorActive) svc.toggleServer() }
     else if (k === "r") { svc.refresh(); svc.refreshAvailableModels() }
     else if (k === "o") { if (svc.canOpen) svc.openApp(m) }
     else if (k === "q") { if (svc.canQuit) svc.quitApp() }
@@ -385,6 +390,7 @@ Column {
       spacing: Style.space(6)
 
       Repeater {
+        id: modelRepeater
         model: svc.models
         delegate: ModelCard {
           width: parent.width

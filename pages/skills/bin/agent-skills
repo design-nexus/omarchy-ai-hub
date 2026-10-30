@@ -1305,7 +1305,37 @@ def token_estimate(name: str, description: str, when_to_use: str, divisor: int =
 # comm is what the process calls itself, so a process that wants to be counted as
 # an agent can be. The consequence of believing it is which of three numbers the
 # bar prints, which is not worth a defence.
-AGENT_COMMS = ("claude", "opencode", "codex")
+AGENT_COMMS = ("claude", "opencode", "codex", "cursor", "pi")
+# Process names to agents. A running Cursor agent is node, named for its
+# main thread, so it is told apart by the package it runs (node_agent).
+COMM_AGENTS = {"claude": "claude", "opencode": "opencode", "codex": "codex", "cursor-agent": "cursor", "pi": "pi"}
+# Processes sharing an agent's name that are not a session: Claude's browser
+# extension bridge and one-shot prints, MCP servers, and the ChatGPT app's
+# bundled codex daemons.
+HELPER_ARGS = {"--chrome-native-host", "-p", "--print", "mcp", "app-server", "exec-server", "mcp-server"}
+
+
+def is_session(pid: str) -> bool:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read(4096).decode("utf-8", "replace").split("\0")
+    except OSError:
+        return False
+    exe = argv[0] if argv else ""
+    if exe.startswith("/usr/lib/chatgpt/") or "/app-server-daemon/" in exe:
+        return False
+    return not HELPER_ARGS.intersection(argv[1:])
+
+
+def node_agent(pid: str) -> str | None:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read(4096).decode("utf-8", "replace").split("\0")
+    except OSError:
+        return None
+    if any("cursor-agent" in arg and arg.endswith("dist-package/index.js") for arg in argv):
+        return "cursor"
+    return None
 
 
 def running_agents() -> dict:
@@ -1324,16 +1354,17 @@ def running_agents() -> dict:
             # A pid that exited between the listing and the read, or one this
             # user may not look at. Both are ordinary.
             continue
-        if comm in live:
-            live[comm] = True
+        agent = COMM_AGENTS.get(comm) or (node_agent(pid) if comm in ("MainThread", "node") else None)
+        if agent and not live[agent] and is_session(pid):
+            live[agent] = True
             if all(live.values()):
                 break
     return live
 
 
-def scan(divisor: int = 4) -> dict:
+def scan(divisor: int = 4, deadline_seconds: float = DEADLINE_SECONDS) -> dict:
     started = time.monotonic()
-    deadline = started + DEADLINE_SECONDS
+    deadline = started + deadline_seconds
     findings: list[dict] = []
     by_real: dict[str, dict] = {}
 
@@ -2244,6 +2275,9 @@ def main(argv: list[str]) -> int:
     p_scan.add_argument("--divisor", type=int, default=4, choices=(3, 4),
                         help="token estimate divisor (default 4, matching Claude Code)")
     p_scan.add_argument("--pretty", action="store_true", help="indent the JSON")
+    # The panel kills a scan after 8 s; finishing first keeps partial results.
+    p_scan.add_argument("--deadline", type=float, default=DEADLINE_SECONDS,
+                        help="stop reading and report what was found after this many seconds")
 
     sub.add_parser("doctor", help="human-readable health report on stdout")
 
@@ -2320,7 +2354,7 @@ def main(argv: list[str]) -> int:
         return describe_command(args)
 
     if args.cmd == "scan":
-        result = scan(divisor=args.divisor)
+        result = scan(divisor=args.divisor, deadline_seconds=args.deadline)
         payload = json.dumps(result, indent=2 if args.pretty else None, ensure_ascii=False)
         if len(payload.encode("utf-8")) > MAX_OUTPUT:
             # Refuse rather than emit a truncated document the reader would parse

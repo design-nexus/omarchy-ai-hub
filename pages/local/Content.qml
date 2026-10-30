@@ -148,7 +148,9 @@ Panel {
       }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) {
+      onTextKey: function(t, modifiers) {
+        // Alt and Ctrl chords belong to the hub (Alt+1..5 switch tabs), not to page keys.
+        if (modifiers & (Qt.AltModifier | Qt.ControlModifier)) return
         var s = root.cursorSection()
         if (s) s.textKey(t)
       }

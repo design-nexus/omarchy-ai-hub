@@ -216,7 +216,8 @@ function aggregateStats(models) {
         var m = list[i] || {}
         vram += parseInt(m.vramBytes || 0, 10)
         ram += parseInt(m.ramBytes || 0, 10)
-        ctx += parseInt(m.contextLength || m.maxContextLength || 0, 10)
+        // The longest context of the loaded models; summing them describes nothing.
+        ctx = Math.max(ctx, parseInt(m.contextLength || m.maxContextLength || 0, 10) || 0)
     }
     return { vramBytes: vram, ramBytes: ram, maxContextLength: ctx }
 }

@@ -1,6 +1,7 @@
 """Helpers shared by the usage scanners."""
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -19,6 +20,112 @@ def write_private(path: Path, data) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(data, handle, separators=(",", ":"), ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def format_hours(hours: float) -> str:
+    """45m, 2.5h, 1d 4h."""
+    if hours <= 0:
+        return "0m"
+    if hours < 1.0:
+        return f"{max(1, round(hours * 60))}m"
+    if hours < 24.0:
+        return f"{hours:.1f}h"
+    days = int(hours // 24)
+    rem_h = int(round(hours % 24))
+    if rem_h >= 24:
+        days, rem_h = days + 1, 0
+    return f"{days}d {rem_h}h" if rem_h > 0 else f"{days}d"
+
+
+def parse_time(value: str) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def bucket_forecast(remaining_pct: float, burn_per_hour: float, resets_at: str) -> tuple[str, str, str]:
+    """(burn text, forecast text, status) for one quota bucket."""
+    reset = parse_time(resets_at) if resets_at else None
+    if reset is None:
+        return "", "", "stable"
+    hours_left = (reset - dt.datetime.now(dt.timezone.utc)).total_seconds() / 3600.0
+    if hours_left <= 0:
+        # The window has rolled over since these numbers were fetched.
+        return "", "Reset since last update", "stale"
+    burn = f"{burn_per_hour:.1f}%/h" if burn_per_hour > 0 else ""
+    if burn_per_hour <= 0.001:
+        return burn, "Paced to reset", "stable"
+    hours_to_empty = remaining_pct / burn_per_hour
+    if hours_to_empty < hours_left:
+        return burn, f"Depletes in ~{format_hours(hours_to_empty)} (before reset)", "critical"
+    at_reset = max(0.0, remaining_pct - burn_per_hour * hours_left)
+    status = "warning" if at_reset < 15.0 else "safe"
+    prefix = "Tight pace" if status == "warning" else "On pace"
+    return burn, f"{prefix} · ~{at_reset:.0f}% at reset", status
+
+
+def quota_burn_rates(provider: str, groups: list[dict]) -> dict[str, float]:
+    """Each bucket's use in %/hour over the last 6 h, from a snapshot kept per run.
+
+    Only the stretch since the bucket last refilled counts: across a reset the
+    remaining share jumps up, which would otherwise cancel the real burn.
+    """
+    path = CACHE_ROOT / provider / "quota_snapshots.json"
+    try:
+        snapshots = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+    except (OSError, ValueError):
+        snapshots = {}
+    now = time.time()
+    rates: dict[str, float] = {}
+    for group in groups:
+        for bucket in group.get("buckets", []):
+            bid = bucket.get("id") or bucket.get("name")
+            if not bid:
+                continue
+            pct = float(bucket.get("remainingPercent", bucket.get("remainingFraction", 1.0) * 100))
+            points = [p for p in snapshots.get(bid, []) if isinstance(p, list) and len(p) == 2 and now - p[0] < 6 * 3600]
+            points.append([now, pct])
+            snapshots[bid] = points
+            start = len(points) - 1
+            while start > 0 and points[start - 1][1] >= points[start][1] - 0.5:
+                start -= 1
+            span_h = (points[-1][0] - points[start][0]) / 3600.0
+            drop = points[start][1] - points[-1][1]
+            rates[bid] = drop / span_h if span_h >= 0.05 and drop > 0 else 0.0
+    try:
+        write_private(path, snapshots)
+    except OSError:
+        pass
+    return rates
+
+
+def apply_forecasts(provider: str, groups: list[dict]) -> list[dict]:
+    """Add burn rate and forecast to every bucket; return the flat `limits` list."""
+    rates = quota_burn_rates(provider, groups)
+    limits = []
+    for group in groups:
+        for bucket in group.get("buckets", []):
+            rate = rates.get(bucket.get("id") or bucket.get("name"), 0.0)
+            burn, forecast, status = bucket_forecast(float(bucket.get("remainingPercent", 100)), rate, bucket.get("resetTime", ""))
+            bucket.update({"burnRatePerHour": rate, "burnRateText": burn, "forecastText": forecast, "forecastStatus": status})
+            limits.append({
+                "label": bucket.get("label", "Limit"),
+                "percent": float(bucket.get("usedPercent", 0)) / 100.0,
+                "resetsAt": bucket.get("resetTime", ""),
+            })
+    return limits
+
+
+def cache_age_iso(path: Path) -> str:
+    """When a cache file was written, for showing how old served numbers are."""
+    try:
+        return dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat()
+    except OSError:
+        return ""
 
 
 class FetchGate:

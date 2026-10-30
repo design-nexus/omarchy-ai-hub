@@ -20,6 +20,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from common import FetchGate, apply_forecasts, cache_age_iso
+
 
 def default_base_dir() -> Path:
     return Path(os.environ.get("CODEX_HOME") or os.environ.get("CHATGPT_DATA_DIR") or os.path.expanduser("~/.codex"))
@@ -85,106 +87,6 @@ def local_date_from_timestamp(value: Any) -> str:
         return date_string(parsed.date())
     except Exception:
         return date_string(dt.datetime.now().date())
-
-
-def format_hours_duration(hours: float) -> str:
-    """Format duration in hours to compact human readable string (e.g. 45m, 2.5h, 1d 4h)."""
-    if hours <= 0:
-        return "0m"
-    if hours < 1.0:
-        return f"{max(1, round(hours * 60))}m"
-    if hours < 24.0:
-        return f"{hours:.1f}h"
-    days = int(hours // 24)
-    rem_h = int(round(hours % 24))
-    if rem_h >= 24:
-        days += 1
-        rem_h = 0
-    return f"{days}d {rem_h}h" if rem_h > 0 else f"{days}d"
-
-
-def compute_bucket_forecast(
-    remaining_pct: float,
-    burn_rate_pct_per_hour: float,
-    resets_at_str: str,
-) -> tuple[str, str, str]:
-    if not resets_at_str:
-        return "", "No reset time provided", "stable"
-
-    try:
-        resets_at = dt.datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
-        now = dt.datetime.now(dt.timezone.utc)
-        hours_until_reset = max(0.0, (resets_at - now).total_seconds() / 3600.0)
-    except Exception:
-        return "", "Invalid reset time", "stable"
-
-    burn_str = f"{burn_rate_pct_per_hour:.1f}%/h" if burn_rate_pct_per_hour > 0 else ""
-
-    if burn_rate_pct_per_hour <= 0.001 or hours_until_reset <= 0:
-        return burn_str, "Paced to reset", "stable"
-
-    hours_until_depleted = remaining_pct / burn_rate_pct_per_hour
-    depletion_duration_str = format_hours_duration(hours_until_depleted)
-
-    if hours_until_depleted < hours_until_reset:
-        return burn_str, f"Depletes in ~{depletion_duration_str} (before reset)", "critical"
-
-    remaining_at_reset = max(0.0, remaining_pct - (burn_rate_pct_per_hour * hours_until_reset))
-    status = "warning" if remaining_at_reset < 15.0 else "safe"
-    prefix = "Tight pace" if status == "warning" else "On pace"
-    return burn_str, f"{prefix} · ~{remaining_at_reset:.0f}% at reset", status
-
-
-def update_quota_snapshots(base_dir: Path, groups: list[dict[str, Any]]) -> dict[str, float]:
-    snap_file = base_dir / "cache" / "quota_snapshots.json"
-    snap_file.parent.mkdir(parents=True, exist_ok=True)
-    now_ts = time.time()
-
-    snapshots: dict[str, list[tuple[float, float]]] = {}
-    if snap_file.exists():
-        try:
-            with open(snap_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                if isinstance(raw, dict):
-                    snapshots = {k: [(float(t), float(pct)) for t, pct in v] for k, v in raw.items() if isinstance(v, list)}
-        except Exception:
-            snapshots = {}
-
-    burn_rates: dict[str, float] = {}
-
-    for g in groups:
-        for b in g.get("buckets", []):
-            bid = b.get("id") or b.get("name")
-            if not bid:
-                continue
-            rem_pct = float(b.get("remainingPercent", (b.get("remainingFraction", 1.0) * 100)))
-            pts = snapshots.setdefault(bid, [])
-            pts.append((now_ts, rem_pct))
-            cutoff = now_ts - (6 * 3600)
-            pts = [(t, pct) for t, pct in pts if t >= cutoff]
-            snapshots[bid] = pts
-
-            if len(pts) >= 2:
-                t_first, p_first = pts[0]
-                t_last, p_last = pts[-1]
-                time_span_h = (t_last - t_first) / 3600.0
-                if time_span_h >= (3.0 / 60.0):
-                    pct_drop = p_first - p_last
-                    burn_rates[bid] = max(0.0, pct_drop / time_span_h) if pct_drop > 0 else 0.0
-                else:
-                    burn_rates[bid] = 0.0
-            else:
-                burn_rates[bid] = 0.0
-
-    try:
-        tmp_snap = snap_file.with_suffix(".tmp")
-        with open(tmp_snap, "w", encoding="utf-8") as f:
-            json.dump(snapshots, f)
-        tmp_snap.replace(snap_file)
-    except Exception:
-        pass
-
-    return burn_rates
 
 
 def read_configured_model(base_dir: Path | None = None) -> str:
@@ -399,20 +301,33 @@ def rpc_request(proc: Any, request_id: int, method: str, params: dict | None = N
     payload = {"id": request_id, "method": method, "params": params or {}}
     proc.stdin.write(json.dumps(payload) + "\n")
     proc.stdin.flush()
+    # Raw reads into our own buffer: a buffered readline() can pull several
+    # replies in at once, after which select() sees nothing left to read and
+    # the reply already in hand would time out.
+    fd = proc.stdout.fileno()
+    buffer = getattr(proc, "rpc_buffer", b"")
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+    while True:
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("id") == request_id:
+                proc.rpc_buffer = buffer
+                return msg
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([fd], [], [], min(0.25, remaining))
         if not ready:
             continue
-        line = proc.stdout.readline()
-        if not line:
+        chunk = os.read(fd, 65536)
+        if not chunk:
             break
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
-        if msg.get("id") == request_id:
-            return msg
+        buffer += chunk
+    proc.rpc_buffer = buffer
     raise TimeoutError(method)
 
 
@@ -430,6 +345,20 @@ def fetch_codex_rpc_quota(base_dir: Path, force: bool = False) -> tuple[list[dic
                         return data.get("groups", []), data.get("tierLabel", "plus"), ""
         except Exception:
             pass
+
+    def cached_groups(error: str) -> tuple[list[dict[str, Any]], str, str]:
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("groups", []), data.get("tierLabel", "plus"), error
+        except Exception:
+            return [], "", error
+
+    # Also spares starting `codex app-server` on every run while it is failing.
+    gate = FetchGate("codex")
+    blocked = gate.blocked(force)
+    if blocked:
+        return cached_groups(blocked)
 
     codex_bin = shutil.which("codex") or str(Path.home() / ".local/bin/codex")
     if not codex_bin or not Path(codex_bin).exists():
@@ -521,17 +450,14 @@ def fetch_codex_rpc_quota(base_dir: Path, force: bool = False) -> tuple[list[dic
                 except Exception:
                     pass
     except Exception as exc:
-        error_str = str(exc)
+        error_str = f"Codex quota request failed: {exc or type(exc).__name__}"
 
-    if not limits_data and cache_file.exists():
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("groups", []), data.get("tierLabel", "plus"), ""
-        except Exception:
-            pass
-
-    return limits_data, tier, error_str
+    if limits_data:
+        gate.succeeded()
+        return limits_data, tier, ""
+    error_str = error_str or "Codex reported no rate limits"
+    gate.failed(error_str)
+    return cached_groups(error_str)
 
 
 def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
@@ -707,30 +633,12 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
     res["activeStatus"] = "Working" if has_active else "Idle"
     res["recentSessions"] = sessions[:10]
     res["activeSessions"] = [s for s in sessions if s.get("isActive")]
-    res["totalSessions"] = len(sessions)
+    # The same 30 days as the prompt and step totals, not the whole index.
+    res["totalSessions"] = len({f.stem for f in session_files})
 
     # 3. Fetch rate limits & quotas
     groups, tier, err_str = fetch_codex_rpc_quota(base_dir, force=force)
-    burn_rates = update_quota_snapshots(base_dir, groups)
-
-    # Format forecast for each bucket
-    limits_list = []
-    for g in groups:
-        for b in g.get("buckets", []):
-            bid = b.get("id") or b.get("name")
-            rem_pct = float(b.get("remainingPercent", 100))
-            rate = burn_rates.get(bid, 0.0)
-            burn_txt, fc_txt, status = compute_bucket_forecast(rem_pct, rate, b.get("resetTime", ""))
-            b["burnRatePerHour"] = rate
-            b["burnRateText"] = burn_txt
-            b["forecastText"] = fc_txt
-            b["forecastStatus"] = status
-
-            limits_list.append({
-                "label": b.get("label", "Limit"),
-                "percent": float(b.get("usedPercent", 0)) / 100.0,
-                "resetsAt": b.get("resetTime", ""),
-            })
+    limits_list = apply_forecasts("codex", groups)
 
 
     # Build model list sorted by usage
@@ -758,8 +666,9 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
         "quotaGroups": groups,
         "limits": limits_list,
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "quotaUpdatedAt": dt.datetime.now(dt.timezone.utc).isoformat() if groups else "",
-        "quotaUpdatedMs": round(time.time() * 1000) if groups else 0,
+        # Served from cache after a failed request: say how old, and why.
+        "quotaError": err_str,
+        "quotaUpdatedAt": (cache_age_iso(base_dir / "cache" / "quota_usage_cache.json") if err_str else dt.datetime.now(dt.timezone.utc).isoformat()) if groups else "",
         "lastFullRefreshMs": round(time.time() * 1000),
         "usageStatusText": "" if (res["hasLocalStats"] or groups) else "No Codex activity found",
         "authHelpText": "" if (res["hasLocalStats"] or groups) else "Run `codex login` to begin.",

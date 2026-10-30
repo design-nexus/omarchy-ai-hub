@@ -42,6 +42,13 @@ Item {
             anchors.fill: parent
             visible: root.running
 
+            // A Canvas keeps what it drew; a theme change needs a fresh paint.
+            Connections {
+                target: root
+                function onColorChanged() { connections.requestPaint() }
+                function onIconSizeChanged() { connections.requestPaint() }
+            }
+
             onPaint: {
                 var ctx = getContext("2d")
                 ctx.clearRect(0, 0, width, height)

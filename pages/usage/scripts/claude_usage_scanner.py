@@ -16,7 +16,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from common import FetchGate, LogCache
+from common import FetchGate, LogCache, apply_forecasts, cache_age_iso
 
 HOME = Path.home()
 BASE = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
@@ -163,100 +163,6 @@ def prompt_text(content: Any) -> str | None:
             return None
         return text(tags.get("command-name", "").strip() + " " + args)
     return text(content) or None
-
-
-def format_hours_duration(hours: float) -> str:
-    if hours < 1.0:
-        mins = max(1, round(hours * 60))
-        return f"{mins}m"
-    if hours < 24.0:
-        return f"{hours:.1f}h"
-    days = hours / 24.0
-    return f"{days:.1f}d"
-
-
-def compute_bucket_forecast(
-    remaining_pct: float,
-    burn_rate_pct_per_hour: float,
-    resets_at_str: str,
-) -> tuple[str, str, str]:
-    if not resets_at_str:
-        return "", "No reset time provided", "stable"
-
-    try:
-        resets_at = dt.datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
-        now = dt.datetime.now(dt.timezone.utc)
-        hours_until_reset = max(0.0, (resets_at - now).total_seconds() / 3600.0)
-    except Exception:
-        return "", "Invalid reset time", "stable"
-
-    burn_str = f"{burn_rate_pct_per_hour:.1f}%/h" if burn_rate_pct_per_hour > 0 else ""
-
-    if burn_rate_pct_per_hour <= 0.001 or hours_until_reset <= 0:
-        return burn_str, "Paced to reset", "stable"
-
-    hours_until_depleted = remaining_pct / burn_rate_pct_per_hour
-    depletion_duration_str = format_hours_duration(hours_until_depleted)
-
-    if hours_until_depleted < hours_until_reset:
-        return burn_str, f"Depletes in ~{depletion_duration_str} (before reset)", "critical"
-
-    remaining_at_reset = max(0.0, remaining_pct - (burn_rate_pct_per_hour * hours_until_reset))
-    status = "warning" if remaining_at_reset < 15.0 else "safe"
-    prefix = "Tight pace" if status == "warning" else "On pace"
-    return burn_str, f"{prefix} · ~{remaining_at_reset:.0f}% at reset", status
-
-
-def update_quota_snapshots(base_dir: Path, groups: list[dict[str, Any]]) -> dict[str, float]:
-    snap_file = base_dir / "cache" / "quota_snapshots.json"
-    snap_file.parent.mkdir(parents=True, exist_ok=True)
-    now_ts = time.time()
-
-    snapshots: dict[str, list[tuple[float, float]]] = {}
-    if snap_file.exists():
-        try:
-            with open(snap_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                if isinstance(raw, dict):
-                    snapshots = {k: [(float(t), float(pct)) for t, pct in v] for k, v in raw.items() if isinstance(v, list)}
-        except Exception:
-            snapshots = {}
-
-    burn_rates: dict[str, float] = {}
-
-    for g in groups:
-        for b in g.get("buckets", []):
-            bid = b.get("id") or b.get("name")
-            if not bid:
-                continue
-            rem_pct = float(b.get("remainingPercent", (b.get("remainingFraction", 1.0) * 100)))
-            pts = snapshots.setdefault(bid, [])
-            pts.append((now_ts, rem_pct))
-            cutoff = now_ts - (6 * 3600)
-            pts = [(t, pct) for t, pct in pts if t >= cutoff]
-            snapshots[bid] = pts
-
-            if len(pts) >= 2:
-                t_first, p_first = pts[0]
-                t_last, p_last = pts[-1]
-                time_span_h = (t_last - t_first) / 3600.0
-                if time_span_h >= (3.0 / 60.0):
-                    pct_drop = p_first - p_last
-                    burn_rates[bid] = max(0.0, pct_drop / time_span_h) if pct_drop > 0 else 0.0
-                else:
-                    burn_rates[bid] = 0.0
-            else:
-                burn_rates[bid] = 0.0
-
-    try:
-        tmp_snap = snap_file.with_suffix(".tmp")
-        with open(tmp_snap, "w", encoding="utf-8") as f:
-            json.dump(snapshots, f)
-        tmp_snap.replace(snap_file)
-    except Exception:
-        pass
-
-    return burn_rates
 
 
 def parse_resets_time(s: str) -> str:
@@ -635,26 +541,8 @@ def scan(base: Path, force: bool = False) -> dict:
     model_list = sorted(models.values(), key=lambda item: (item["prompts"], item["steps"], item["name"]), reverse=True)
 
     # Fetch quota limits
-    quota_groups, plan_tier, _ = fetch_claude_quota(base, force=force)
-    burn_rates = update_quota_snapshots(base, quota_groups)
-
-    limits_list = []
-    for g in quota_groups:
-        for b in g.get("buckets", []):
-            bid = b.get("id") or b.get("name")
-            rem_pct = float(b.get("remainingPercent", 100))
-            rate = burn_rates.get(bid, 0.0)
-            burn_txt, fc_txt, status = compute_bucket_forecast(rem_pct, rate, b.get("resetTime", ""))
-            b["burnRatePerHour"] = rate
-            b["burnRateText"] = burn_txt
-            b["forecastText"] = fc_txt
-            b["forecastStatus"] = status
-
-            limits_list.append({
-                "label": b.get("label", "Limit"),
-                "percent": float(b.get("usedPercent", 0)) / 100.0,
-                "resetsAt": b.get("resetTime", ""),
-            })
+    quota_groups, plan_tier, quota_error = fetch_claude_quota(base, force=force)
+    limits_list = apply_forecasts("claude", quota_groups)
 
 
     has_stats = bool(sessions) or bool(quota_groups)
@@ -692,8 +580,9 @@ def scan(base: Path, force: bool = False) -> dict:
         "premiumRequests": 0,
         "planTier": plan_tier,
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "quotaUpdatedAt": dt.datetime.now(dt.timezone.utc).isoformat() if quota_groups else "",
-        "quotaUpdatedMs": round(time.time() * 1000) if quota_groups else 0,
+        # Served from cache after a failed request: say how old, and why.
+        "quotaError": quota_error,
+        "quotaUpdatedAt": (cache_age_iso(base / "cache" / "quota_usage_cache.json") if quota_error else dt.datetime.now(dt.timezone.utc).isoformat()) if quota_groups else "",
         "lastFullRefreshMs": round(time.time() * 1000),
         "usageStatusText": "" if has_stats else "No local activity found",
         "authHelpText": "",

@@ -190,21 +190,41 @@ def parse_history_file(history_path: Path, recent_dates: list[str]) -> tuple[dic
     return daily_prompts, total_prompts, recent_prompts, workspace_counter
 
 
-def get_flocked_inodes() -> set[int] | None:
-    """Return set of inodes that have active FLOCK advisory write locks in /proc/locks."""
+def flock_holders(write_only: bool = True) -> dict[tuple[int, int, int], set[int]] | None:
+    """FLOCK locks in /proc/locks: (major, minor, inode) -> holding pids.
+
+    The device is part of the key: inode numbers repeat across filesystems.
+    """
     try:
-        locked = set()
+        held: dict[tuple[int, int, int], set[int]] = {}
         with open("/proc/locks", "r") as f:
             for line in f:
                 parts = line.split()
                 # Format: 24: FLOCK ADVISORY WRITE <pid> 00:1e:<inode> 0 EOF
-                if len(parts) >= 6 and parts[1] == "FLOCK" and parts[3] == "WRITE":
-                    dev_ino = parts[5].split(":")
-                    if len(dev_ino) == 3:
-                        locked.add(int(dev_ino[2]))
-        return locked
+                if len(parts) < 6 or parts[1] != "FLOCK" or (write_only and parts[3] != "WRITE"):
+                    continue
+                dev_ino = parts[5].split(":")
+                if len(dev_ino) == 3:
+                    key = (int(dev_ino[0], 16), int(dev_ino[1], 16), int(dev_ino[2]))
+                    held.setdefault(key, set()).add(int(parts[4]))
+        return held
     except Exception:
         return None
+
+
+def lock_key(path: Path) -> tuple[int, int, int]:
+    st = path.stat()
+    return (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+
+
+def is_antigravity(pid: int) -> bool:
+    try:
+        argv = (Path(f"/proc/{pid}") / "cmdline").read_bytes().decode("utf-8", errors="replace").split("\0")
+        exe = os.path.realpath(f"/proc/{pid}/exe")
+    except OSError:
+        return False
+    names = {os.path.basename(argv[0]) if argv else "", os.path.basename(exe)}
+    return bool(names & {"agy", "antigravity"}) or "antigravity" in exe
 
 
 _STALE_LOCK_THRESHOLD_SECS = 48 * 3600  # 48 hours
@@ -236,7 +256,7 @@ def parse_presence(presence_dir: Path) -> set[str]:
     if not presence_dir.exists():
         return active_ids
 
-    flocked_inodes = get_flocked_inodes()
+    held = flock_holders()
     for p in presence_dir.glob("*.lock"):
         cid = sanitize_plain_text(p.stem, 100)
         if not cid:
@@ -255,9 +275,9 @@ def parse_presence(presence_dir: Path) -> set[str]:
                 except (BlockingIOError, PermissionError, OSError):
                     # An exclusive lock is held! Verify against /proc/locks if available
                     # to guard against any transient contention.
-                    if flocked_inodes is not None:
+                    if held is not None:
                         try:
-                            if p.stat().st_ino in flocked_inodes:
+                            if lock_key(p) in held:
                                 active_ids.add(cid)
                         except Exception:
                             active_ids.add(cid)
@@ -274,19 +294,10 @@ def kill_session(cid: str, base_dir: Path) -> bool:
     pids = set()
     lock_file = base_dir / "presence" / f"{cid}.lock"
 
-    # 1. Fast O(1) PID resolution from /proc/locks by inode
+    # 1. Whoever holds the lock file's flock, by device and inode
     if lock_file.exists():
         try:
-            target_ino = lock_file.stat().st_ino
-            with open("/proc/locks", "r") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 6 and parts[1] == "FLOCK":
-                        dev_ino = parts[5].split(":")
-                        if len(dev_ino) == 3 and int(dev_ino[2]) == target_ino:
-                            p = int(parts[4])
-                            if p != os.getpid():
-                                pids.add(p)
+            pids |= (flock_holders(write_only=False) or {}).get(lock_key(lock_file), set())
         except Exception:
             pass
 
@@ -304,7 +315,8 @@ def kill_session(cid: str, base_dir: Path) -> bool:
                 pass
 
     killed_any = False
-    for pid in pids:
+    # Only Antigravity itself: a lock or an open file is not proof enough.
+    for pid in (p for p in pids if p != os.getpid() and is_antigravity(p)):
         try:
             os.kill(pid, signal.SIGTERM)
             killed_any = True
@@ -731,7 +743,8 @@ def trigger_bg_quota_refresh(base_dir: Path, agy_bin: str) -> None:
     now = time.time()
     if flag_file.exists():
         try:
-            if now - flag_file.stat().st_mtime < 30:
+            # Also the retry delay after a failed refresh: the flag stays.
+            if now - flag_file.stat().st_mtime < 180:
                 return
         except Exception:
             pass
@@ -753,7 +766,6 @@ def trigger_bg_quota_refresh(base_dir: Path, agy_bin: str) -> None:
 def bg_refresh_quota(base_dir: Path) -> None:
     """Worker function executed in background to fetch quota and update snapshots."""
     cache_path = base_dir / "cache" / "quota_usage_cache.json"
-    flag_file = base_dir / "cache" / "quota_refresh.flag"
     agy_bin = shutil.which("agy") or str(Path.home() / ".local/bin/agy")
     try:
         res = subprocess.run(
@@ -773,11 +785,6 @@ def bg_refresh_quota(base_dir: Path) -> None:
                 update_quota_snapshots(base_dir, cmd_data.get("groups", []))
     except Exception:
         pass
-    finally:
-        try:
-            flag_file.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 def fetch_agy_usage_quota(base_dir: Path, force: bool = False) -> dict[str, Any]:
@@ -849,91 +856,10 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
     if base_dir and groups:
         burn_rates = update_quota_snapshots(base_dir, groups)
 
+    # Nothing reported yet (offline, or before the first query): no buckets,
+    # rather than made-up full ones.
     if not groups:
-        # Graceful default structure when offline / before first query
-        defaults = [
-            {
-                "name": "Gemini Models",
-                "description": "Models within this group: Gemini Flash, Gemini Pro",
-                "color": "#38BDF8",
-                "buckets": [
-                    {
-                        "id": "gemini-weekly",
-                        "name": "Weekly Limit Remaining",
-                        "label": "Weekly Limit",
-                        "window": "weekly",
-                        "remainingFraction": 1.0,
-                        "remainingPercent": 100,
-                        "usedPercent": 0,
-                        "resetTime": "",
-                        "description": "Weekly rolling quota",
-                        "color": "#38BDF8",
-                        "burnRatePerHour": 0.0,
-                        "burnRateText": "",
-                        "forecastText": "Paced to reset",
-                        "forecastStatus": "stable"
-                    },
-                    {
-                        "id": "gemini-5h",
-                        "name": "Five Hour Limit Remaining",
-                        "label": "5-Hour Limit",
-                        "window": "5h",
-                        "remainingFraction": 1.0,
-                        "remainingPercent": 100,
-                        "usedPercent": 0,
-                        "resetTime": "",
-                        "description": "5-hour burst window",
-                        "color": "#38BDF8",
-                        "burnRatePerHour": 0.0,
-                        "burnRateText": "",
-                        "forecastText": "Paced to reset",
-                        "forecastStatus": "stable"
-                    }
-                ]
-            },
-            {
-                "name": "Claude and GPT models",
-                "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
-                "color": "#D97757",
-                "buckets": [
-                    {
-                        "id": "3p-weekly",
-                        "name": "Weekly Limit Remaining",
-                        "label": "Weekly Limit",
-                        "window": "weekly",
-                        "remainingFraction": 1.0,
-                        "remainingPercent": 100,
-                        "usedPercent": 0,
-                        "resetTime": "",
-                        "description": "Weekly rolling quota",
-                        "color": "#D97757",
-                        "burnRatePerHour": 0.0,
-                        "burnRateText": "",
-                        "forecastText": "Paced to reset",
-                        "forecastStatus": "stable"
-                    },
-                    {
-                        "id": "3p-5h",
-                        "name": "Five Hour Limit Remaining",
-                        "label": "5-Hour Limit",
-                        "window": "5h",
-                        "remainingFraction": 1.0,
-                        "remainingPercent": 100,
-                        "usedPercent": 0,
-                        "resetTime": "",
-                        "description": "5-hour burst window",
-                        "color": "#D97757",
-                        "burnRatePerHour": 0.0,
-                        "burnRateText": "",
-                        "forecastText": "Paced to reset",
-                        "forecastStatus": "stable"
-                    }
-                ]
-            }
-        ]
-        for g in defaults:
-            g["buckets"].sort(key=bucket_order)
-        return defaults
+        return []
 
     formatted = []
     for g in groups:
@@ -1377,6 +1303,7 @@ def scan(base_dir: Path, force: bool = False) -> dict[str, Any]:
         "modelUsage": model_usage_dict,
         "modelList": model_list,
         "quotaGroups": quota_groups,
+        "quotaNote": "" if quota_groups else "Antigravity has not reported quota yet.",
         "limits": limits,
         "recentWorkspaces": recent_workspaces,
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),

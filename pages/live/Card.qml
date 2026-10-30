@@ -93,7 +93,9 @@ PanelKeyCatcher {
   // Only activateRequested, never returnRequested as well: Enter fires
   // both, and a handler on each runs the action twice.
   onActivateRequested: panel.activateCursor()
-  onTextKey: function(t) {
+  onTextKey: function(t, modifiers) {
+    // Alt and Ctrl chords belong to the hub (Alt+1..5 switch tabs), not to page keys.
+    if (modifiers & (Qt.AltModifier | Qt.ControlModifier)) return
     // The letter keys stay about the server, wherever inside it the
     // cursor happens to be: you kill a server, never an agent.
     var session = panel.sessionAt(panel.cursor)

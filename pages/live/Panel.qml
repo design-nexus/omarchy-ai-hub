@@ -360,13 +360,28 @@ Panel {
   // bar's settings screen reads, so the two can never disagree and there is no
   // config file of our own to keep. Applied locally first, so the panel
   // redraws on the click rather than on the write coming back.
+  //
+  // The values wait in pendingSettings until shell.json brings them back:
+  // assigning `settings` itself would cut its binding to the hub, and this
+  // page would stop hearing about later changes.
+  property var pendingSettings: ({})
+  onSettingsChanged: pendingSettings = ({})
+
+  function setting(name, fallback) {
+    var source = name in pendingSettings ? pendingSettings : settings
+    var value = source ? source[name] : undefined
+    return value === undefined || value === null ? fallback : value
+  }
+
   function persistSettings(values) {
     var entry = { id: root.moduleName }
     for (var existing in root.settings)
       if (existing !== "id") entry[existing] = root.settings[existing]
-    for (var key in values) entry[key] = values[key]
+    var pending = {}
+    for (var held in root.pendingSettings) pending[held] = entry[held] = root.pendingSettings[held]
+    for (var key in values) pending[key] = entry[key] = values[key]
 
-    root.settings = entry
+    root.pendingSettings = pending
     if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }

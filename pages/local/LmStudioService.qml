@@ -60,7 +60,9 @@ Item {
   property var actionArgs: []
   property string currentLms: ""
 
-  readonly property bool busy: whichProcess.running || currentLms !== "" || wantAction
+  // Only an action or a pending toggle: a background status poll must not
+  // swallow a click on the switch.
+  readonly property bool busy: currentLms === "action" || wantAction || _desiredServerState !== -1
 
   // Settings with defaults
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 30, 5, 3600)
@@ -128,6 +130,8 @@ Item {
     else if (kind === "action") proc = actionProcess
     proc.command = cmd
     proc.running = true
+    // Loading a large model or a cold server start takes minutes, not seconds.
+    pollWatchdog.interval = kind === "action" ? 660000 : 15000
     pollWatchdog.restart()
   }
 
@@ -167,7 +171,8 @@ Item {
   }
 
   function markServerDown() {
-    if (_desiredServerState === 1) return
+    if (_desiredServerState === 1 && startTimeout.running) return
+    if (_desiredServerState !== -1) _desiredServerState = -1
     serverRunning = false
     serverPort = 0
     statusText = "Server stopped"
@@ -251,6 +256,7 @@ Item {
   function startServer() {
     if (!installed || actionPending()) return
     _desiredServerState = 1
+    startTimeout.restart()
     runAction(["server", "start"], "Starting server…")
   }
 
@@ -306,8 +312,9 @@ Item {
     Quickshell.execDetached(["gtk-launch", "lmstudio"])
   }
 
+  // Your LM Studio process by name, not anything whose command line mentions it.
   function quitApp() {
-    Quickshell.execDetached(["bash", "-c", "pkill -f lm-studio"])
+    Quickshell.execDetached(["pkill", "-u", Quickshell.env("USER") || "", "-x", "lm-studio"])
   }
 
   function runAction(args, label) {
@@ -326,6 +333,18 @@ Item {
     running: root.polling
     triggeredOnStart: true
     onTriggered: root.refresh()
+  }
+
+  // A start that never brings the server up stops showing "Starting…".
+  Timer {
+    id: startTimeout
+    interval: 30000
+    onTriggered: {
+      if (root._desiredServerState !== 1 || root.serverRunning) return
+      root._desiredServerState = -1
+      root.lastError = "LM Studio's server did not start"
+      root.refresh()
+    }
   }
 
   // Timer: delayed refresh after action
@@ -385,6 +404,10 @@ Item {
       var text = String(probeStdout.text || "").trim()
       if (text === "up") {
         root.serverRunning = true
+        if (root._desiredServerState === 1) {
+          root._desiredServerState = -1
+          startTimeout.stop()
+        }
         if (root.detailed) {
           root.refreshStatusAndModels()
           root.refreshAvailableModels()
@@ -426,7 +449,9 @@ Item {
     onExited: function(exitCode) {
       var stdout = String(psStdout.text || "")
       var stderr = String(psStderr.text || "")
-      if (exitCode === 0) root.parseModelsOutput(stdout)
+      if (!root.serverRunning) {
+        // Arrived after the server was seen stopping; the list is stale.
+      } else if (exitCode === 0) root.parseModelsOutput(stdout)
       else {
         root.models = []
         root.modelCount = 0
@@ -445,7 +470,7 @@ Item {
     stderr: StdioCollector { id: lsStderr; waitForEnd: true }
     onExited: function(exitCode) {
       var stdout = String(lsStdout.text || "")
-      if (exitCode === 0) root.availableModels = Model.parseLs(stdout)
+      if (exitCode === 0 && root.serverRunning) root.availableModels = Model.parseLs(stdout)
       root.finishLms("ls")
     }
   }

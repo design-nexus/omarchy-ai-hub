@@ -319,25 +319,34 @@ def regular_lstat(path, budget):
 
 
 def bounded_paths(patterns, budget, cap=None):
-    """Return at most cap regular matches without materializing an entire glob."""
+    """The cap newest regular matches, within the budget's path limit.
+
+    Every match is stat'ed before the cap applies: glob order is directory
+    order, so capping as it goes would keep an arbitrary set rather than the
+    newest sessions.
+    """
     cap = CANDIDATE_CAP if cap is None else cap
     found, seen = [], set()
+
+    def newest():
+        found.sort(key=lambda item: item[1].st_mtime, reverse=True)
+        if len(found) > cap:
+            budget.mark("candidate limit")
+        return found[:cap]
+
     for pattern, recursive in patterns:
         for path in glob.iglob(pattern, recursive=recursive):
             if not budget.active():
-                return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
+                return newest()
             if path in seen:
                 continue
-            if len(found) >= cap:
-                budget.mark("candidate limit")
-                return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
             seen.add(path)
             info = regular_lstat(path, budget)
             if info is not None:
                 found.append((path, info))
             elif budget.paths >= budget.max_paths:
-                return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
-    return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
+                return newest()
+    return newest()
 
 
 def open_regular_fd(path, budget):
@@ -1032,7 +1041,7 @@ def scan_muse(budget=None):
             rows = con.execute(
                 "SELECT session_id, title, prompt_count, model_id, workspace_root,"
                 " created_at_us, updated_at_us, first_user_prompt, session_log_path"
-                " FROM sessions").fetchall()
+                " FROM sessions ORDER BY updated_at_us DESC LIMIT ?", (PER_AGENT_CAP * 2,)).fetchall()
         except sqlite3.Error:
             rows = []
         finally:
@@ -1183,12 +1192,14 @@ def normalize_session(session, agent, budget):
     }
 
 
-def collect(budget=None):
+def collect(budget=None, agents=None):
     budget = ensure_budget(budget)
     sessions = []
     deadline_state = arm_deadline(budget)
     try:
         for agent, scan in SCANNERS.items():
+            if agents is not None and agent not in agents:
+                continue
             if not budget.active():
                 break
             # A resumed session writes a fresh transcript file with the same
@@ -1303,11 +1314,16 @@ def valid_id(agent, sid):
     return re.match(ID_PATTERNS.get(agent, r"$^"), str(sid)) is not None
 
 
+_found = {}
+
+
 def find(agent, sid):
-    for s in collect()["sessions"]:
-        if s["agent"] == agent and s["id"] == sid:
-            return s
-    return None
+    """The session, scanning only its own agent with a fresh budget, once per call."""
+    key = (agent, sid)
+    if key not in _found:
+        _found[key] = next((s for s in collect(agents=[agent])["sessions"]
+                            if s["agent"] == agent and s["id"] == sid), None)
+    return _found[key]
 
 
 def spawn(argv):
@@ -1549,12 +1565,15 @@ def delete(agent, sid):
             pass
         return
     if agent == "grok":
-        root = grok_home()
+        # bounded_paths only matches regular files, so resolve the session
+        # directory through its summary and remove that directory.
         budget = ScanBudget(seconds=1.0, max_paths=32, max_open_files=8, max_bytes=1024)
-        dirs = bounded_paths([(root + "/sessions/*/" + sid, False)], budget)
-        for dir_path, _info in dirs:
+        for path, _info in bounded_paths([(grok_home() + "/sessions/*/" + sid + "/summary.json", False)], budget, cap=8):
+            parent = os.path.dirname(path)
+            if os.path.basename(parent) != sid or os.path.islink(parent):
+                continue
             try:
-                shutil.rmtree(dir_path)
+                shutil.rmtree(parent)
             except OSError:
                 pass
         return
@@ -1579,6 +1598,13 @@ def delete(agent, sid):
                 os.remove(path)
         except OSError:
             pass
+        # Claude keeps subagent transcripts and tool results in <id>/ beside <id>.jsonl.
+        sidecar = path[:-len(".jsonl")] if agent == "claude" and path.endswith(".jsonl") else ""
+        if sidecar and os.path.basename(sidecar) == sid and os.path.isdir(sidecar) and not os.path.islink(sidecar):
+            try:
+                shutil.rmtree(sidecar)
+            except OSError:
+                pass
 
 
 ACTIONS = {"resume": resume, "peek": peek, "peek-render": peek_render,
@@ -1590,6 +1616,9 @@ if __name__ == "__main__":
     elif len(sys.argv) >= 4 and sys.argv[1] in ACTIONS and sys.argv[2] in SCANNERS:
         if not valid_id(sys.argv[2], sys.argv[3]):
             sys.exit(2)
+        # Exit 3 tells the panel the session is gone, rather than doing nothing quietly.
+        if sys.argv[1] != "copy" and find(sys.argv[2], sys.argv[3]) is None:
+            sys.exit(3)
         ACTIONS[sys.argv[1]](sys.argv[2], sys.argv[3])
     else:
         sys.exit(2)
