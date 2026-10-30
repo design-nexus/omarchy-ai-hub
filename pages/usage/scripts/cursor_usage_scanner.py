@@ -94,12 +94,10 @@ def resolve_executable() -> str:
     return ""
 
 
-def cursor_active(executable: str) -> bool:
-    """A Cursor agent is running. The CLI is a launcher script, so the process
-    to look for is node running the package's index.js beside it."""
-    if not executable:
-        return False
-    entry_point = os.path.join(os.path.dirname(os.path.realpath(executable)), "index.js").encode()
+def cursor_active(executable: str = "") -> bool:
+    """A Cursor agent is running: node running the cursor-agent package's
+    index.js. Matched on the process rather than on where the CLI resolves,
+    which under mise is a shim pointing at mise itself."""
     proc = Path("/proc")
     if not proc.exists():
         return False
@@ -107,10 +105,11 @@ def cursor_active(executable: str) -> bool:
         if not entry.name.isdigit():
             continue
         try:
-            if entry_point in (entry / "cmdline").read_bytes().split(b"\0"):
-                return True
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
+        if any(b"cursor-agent" in arg and arg.endswith(b"dist-package/index.js") for arg in argv):
+            return True
     return False
 
 
