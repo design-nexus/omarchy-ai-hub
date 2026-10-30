@@ -28,6 +28,8 @@ PERIOD_LABELS = {
 PERIOD_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 PLAN_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+USER_QUERY = re.compile(r"<user_query>(.*?)(?:</user_query>|$)", re.S)
+WRAPPER = re.compile(r"<([a-z_]+)>.*?</\1>", re.S)
 
 
 def stamp(value) -> float:
@@ -279,7 +281,7 @@ def plan_tier(executable: str, data_home: Path) -> str:
 
 def content_text(content) -> str:
     if isinstance(content, str):
-        return clip(content)
+        return content
     if isinstance(content, list):
         parts = []
         for block in content:
@@ -287,10 +289,17 @@ def content_text(content) -> str:
                 parts.append(block)
             elif isinstance(block, dict) and block.get("type") in (None, "text"):
                 parts.append(str(block.get("text") or ""))
-        return clip(" ".join(parts))
+        return " ".join(parts)
     if isinstance(content, dict):
-        return clip(content.get("text") or content.get("content") or "")
+        return str(content.get("text") or content.get("content") or "")
     return ""
+
+
+def prompt_text(content) -> str:
+    """The typed prompt, without the <timestamp> and context blocks Cursor wraps around it."""
+    text = content_text(content)
+    query = USER_QUERY.search(text)
+    return clip(query.group(1) if query else WRAPPER.sub(" ", text))
 
 
 def message_of(obj: dict) -> tuple[str, dict]:
@@ -345,9 +354,7 @@ def read_jsonl(path: Path, session: dict, tools: Counter, models: dict[str, dict
                     if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
                         tools[clip(block.get("name"), 60)] += 1
             if role == "user":
-                preview = content_text(content)
-                if preview.startswith("<user_query>"):
-                    preview = preview[len("<user_query>"):]
+                preview = prompt_text(content)
                 if preview and not session["preview"]:
                     session["preview"] = preview
                 session["prompts"] += 1
