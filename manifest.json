@@ -26,6 +26,9 @@
       "lmstudio",
       "claude",
       "codex",
+      "grok",
+      "cursor",
+      "xsi",
       "ollama",
       "local",
       "llm"

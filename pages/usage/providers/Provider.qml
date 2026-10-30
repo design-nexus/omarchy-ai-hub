@@ -38,8 +38,6 @@ Item {
   property var toolUsage: data.toolUsage || ({})
   property var modelUsage: data.modelUsage || ({})
   property var modelList: data.modelList || []
-  // Per-agent scanner; only Codex, Grok, and Antigravity implement --kill.
-  readonly property string scannerScriptPath: canKill ? scriptPath(providerId + "_usage_scanner.py") : ""
   property string executable: data.display ? data.display.executable : providerId
   property bool canKill: data.canKill !== false
   property string quotaNote: data.quotaNote || ""
@@ -47,16 +45,25 @@ Item {
   readonly property bool agentEnabled: {
     var key = ({
       codex: "enableCodex",
-      grok: "enableGrok",
+      xsi: "enableXsi",
       antigravity: "enableAntigravity",
       claude: "enableClaude",
       copilot: "enableCopilot",
-      cursor: "enableCursor",
       muse: "enableMuse"
     })[providerId]
     if (!key) return true
     var value = settings ? settings[key] : undefined
+    // XSI replaced the Grok and Cursor toggles: off only if both were off.
+    if (key === "enableXsi" && (value === undefined || value === null))
+      return !(settings && settings.enableGrok === false && settings.enableCursor === false)
     return value !== false
+  }
+  // The scanner that can kill one of this provider's sessions; only Codex,
+  // Grok, and Antigravity implement --kill. XSI sessions name their source.
+  function killScriptPath(session) {
+    var killable = session && session.canKill !== undefined ? session.canKill === true : canKill
+    if (!killable) return ""
+    return scriptPath(((session && session.source) || providerId) + "_usage_scanner.py")
   }
   readonly property string scanner: scriptPath("usage_scanner.py")
   function scriptPath(name) { return String(Qt.resolvedUrl("../scripts/" + name)).replace("file://", "") }

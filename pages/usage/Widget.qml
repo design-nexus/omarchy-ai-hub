@@ -193,19 +193,21 @@ BarWidget {
     return !!p && !settingsMode && p.ready
   }
 
-  function resumeSession(conversationId, workspacePath) {
-    if (!conversationId || !provider) return
-    var id = provider.providerId
+  // XSI sessions carry their own CLI (source and executable); others use the provider's.
+  function resumeSession(session) {
+    if (!session || !session.conversationId || !provider) return
+    var id = session.source || provider.providerId
+    var exe = session.executable || provider.executable
     var resumeArgs = (id === "claude" || id === "copilot" || id === "cursor")
-      ? [provider.executable, "--resume", conversationId]
-      : [provider.executable, "resume", conversationId]
-    launch(getTerminalArgs(resumeArgs, workspacePath))
+      ? [exe, "--resume", session.conversationId]
+      : [exe, "resume", session.conversationId]
+    launch(getTerminalArgs(resumeArgs, session.workspace))
     root.close()
   }
 
   function resumeIndex(idx) {
     var list = provider ? (provider.recentSessions || []) : []
-    if (idx >= 0 && idx < Math.min(5, visibleSessionCount)) resumeSession(list[idx].conversationId, list[idx].workspace)
+    if (idx >= 0 && idx < Math.min(5, visibleSessionCount)) resumeSession(list[idx])
   }
 
   function newSession() {
@@ -214,9 +216,10 @@ BarWidget {
     root.close()
   }
 
-  function killSession(conversationId) {
-    if (!conversationId || !provider || !provider.scannerScriptPath) return
-    Quickshell.execDetached(["python3", provider.scannerScriptPath, "--kill", conversationId])
+  function killSession(session) {
+    var script = provider ? provider.killScriptPath(session) : ""
+    if (!session || !session.conversationId || !script) return
+    Quickshell.execDetached(["python3", script, "--kill", session.conversationId])
     killRefreshTimer.restart()
   }
 
@@ -286,10 +289,15 @@ BarWidget {
     catch (e) { return fallback }
   }
 
-  readonly property var agentSettingKeys: ["enableCodex", "enableGrok", "enableAntigravity", "enableClaude", "enableCopilot", "enableCursor", "enableMuse"]
+  readonly property var agentSettingKeys: ["enableCodex", "enableXsi", "enableAntigravity", "enableClaude", "enableCopilot", "enableMuse"]
 
   function normalizedSettings(source) {
     var next = cloneObject(source, {}) || {}
+    // XSI replaced the Grok and Cursor toggles: off only if both were off.
+    if (next.enableXsi === undefined || next.enableXsi === null)
+      next.enableXsi = !(next.enableGrok === false && next.enableCursor === false)
+    delete next.enableGrok
+    delete next.enableCursor
     var refresh = Number(next.refreshIntervalSec === undefined || next.refreshIntervalSec === null ? 60 : next.refreshIntervalSec)
     next.refreshIntervalSec = Math.round(clamp(isFinite(refresh) ? refresh : 60, 10, 1800))
 
@@ -446,8 +454,9 @@ BarWidget {
     function settings(): string { root.openSettings(); return "ok" }
     function openSettings(): string { root.openSettings(); return "ok" }
     function select(id: string): string {
-      if (!usageMain.providerFor(id)) return "unknown or disabled agent: " + id
-      root.selectProvider(id)
+      var provider = usageMain.providerFor(id)
+      if (!provider) return "unknown or disabled agent: " + id
+      root.selectProvider(provider.providerId)
       return "ok"
     }
     function setBadgeMode(mode: string): string {
@@ -925,7 +934,7 @@ BarWidget {
 
       IconButton {
         iconText: ""
-        tooltipText: "New session (n)"
+        tooltipText: provider && provider.providerId === "xsi" ? "New " + provider.executable + " session (n)" : "New session (n)"
         enabled: !!provider && provider.ready
         onClicked: root.newSession()
       }
@@ -1534,7 +1543,7 @@ BarWidget {
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: root.resumeSession(modelData.conversationId, modelData.workspace)
+            onClicked: root.resumeSession(modelData)
           }
 
           ColumnLayout {
@@ -1566,7 +1575,7 @@ BarWidget {
               }
 
               Pill {
-                visible: !!modelData.isActive && !!root.provider && root.provider.canKill
+                visible: !!modelData.isActive && !!root.provider && root.provider.killScriptPath(modelData) !== ""
                 text: ""
                 color: killMouse.containsMouse ? root.urgent : root.track
                 textColor: killMouse.containsMouse ? root.onAccent : root.foreground
@@ -1579,7 +1588,7 @@ BarWidget {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.killSession(modelData.conversationId)
+                  onClicked: root.killSession(modelData)
                 }
               }
 
@@ -1593,6 +1602,11 @@ BarWidget {
             RowLayout {
               Layout.fillWidth: true
               spacing: 6
+
+              Pill {
+                visible: !!modelData.sourceName
+                text: modelData.sourceName || ""
+              }
 
               Pill {
                 visible: !!modelData.workspaceName
@@ -1674,11 +1688,10 @@ BarWidget {
       Repeater {
         model: [
           { key: "enableCodex", label: "Codex" },
-          { key: "enableGrok", label: "Grok" },
+          { key: "enableXsi", label: "XSI (Grok + Cursor)" },
           { key: "enableAntigravity", label: "Antigravity" },
           { key: "enableClaude", label: "Claude Code" },
           { key: "enableCopilot", label: "Copilot" },
-          { key: "enableCursor", label: "Cursor" },
           { key: "enableMuse", label: "Muse" }
         ]
         delegate: SettingRow {

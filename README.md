@@ -4,7 +4,7 @@ One Omarchy bar icon for your AI tooling. Click it for a tabbed panel with five 
 
 | Tab | What it shows |
 | --- | --- |
-| **Usage** | Today's usage, seven-day history, models, quotas and recent sessions for Codex, Grok, Antigravity, Claude Code, GitHub Copilot, Cursor and Muse |
+| **Usage** | Today's usage, seven-day history, models, quotas and recent sessions for Codex, XSI (Grok and Cursor, which share one quota), Antigravity, Claude Code, GitHub Copilot and Muse |
 | **Live** | Running [herdr](https://github.com/herdrdev/herdr) sessions, the project and agents in each, and which agents are waiting on you |
 | **Sessions** | Past sessions from Claude Code, Codex, opencode, Copilot, Pi, Gemini, Grok and Muse, to resume, peek at, open or delete |
 | **Skills** | The skills Claude Code, OpenCode and Codex load, what they cost in context, with your own categories and notes |
@@ -28,7 +28,7 @@ Hover the icon for a summary of all of it.
 - [Omarchy](https://omarchy.org/)
 - Python 3
 - Each tab needs its own tool, and shows a status message when that tool is missing:
-  - **Usage** and **Sessions:** at least one agent CLI you have used, such as `claude`, `codex`, `copilot`, `grok` or `muse`
+  - **Usage** and **Sessions:** at least one agent CLI you have used, such as `claude`, `codex`, `copilot`, `grok`, Cursor's `agent` or `muse`
   - **Live:** [herdr](https://github.com/herdrdev/herdr)
   - **Local:** [LM Studio](https://lmstudio.ai/) with its `lms` CLI, [Ollama](https://ollama.com/) (`sudo pacman -S ollama`), or both
 
@@ -61,7 +61,7 @@ Use `left`, `center` or `right`; `--before` and `--after` place it next to anoth
 
 Each tab keeps its own keys. The ones worth knowing:
 
-- **Usage:** `1`–`5` resume a recent session, `n` starts a new one, `r` refreshes, `s` opens settings.
+- **Usage:** `1`–`5` resume a recent session, `n` starts a new one, `r` refreshes, `s` opens settings. On XSI, each session is tagged Grok or Cursor and resumes in its own CLI, and `n` opens whichever of the two you used last.
 - **Sessions:** `Enter` resumes, `p` peeks at the transcript, `o` opens the folder, `y` copies the ID, `d` twice deletes, `←`/`→` filter by agent, `r` rescans.
 - **Local:** `↑`/`↓` move through both servers, `Enter` acts on the selection, and `s` starts or stops, `r` refreshes, `o` opens (LM Studio's app, or a chat with the selected Ollama model), `u` unloads and `c` copies, all for the server under the cursor.
 - **Live:** click a session to focus its window (or open one), or click an agent to land on its pane. A herdr card can be pinned to the desktop and stays after the panel closes.
