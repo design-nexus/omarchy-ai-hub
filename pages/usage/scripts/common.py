@@ -83,6 +83,8 @@ def quota_burn_rates(provider: str, groups: list[dict]) -> dict[str, float]:
 
     Only the stretch since the bucket last refilled counts: across a reset the
     remaining share jumps up, which would otherwise cancel the real burn.
+    Providers report whole percents that can flicker by one (99, 100, 99), so a
+    rise of a point or less is not a refill.
     """
     path = CACHE_ROOT / provider / "quota_snapshots.json"
     try:
@@ -98,12 +100,13 @@ def quota_burn_rates(provider: str, groups: list[dict]) -> dict[str, float]:
             bid = bucket.get("id") or bucket.get("name")
             if not bid:
                 continue
-            pct = float(bucket.get("remainingPercent", bucket.get("remainingFraction", 1.0) * 100))
+            fraction = bucket.get("remainingFraction")
+            pct = float(fraction) * 100 if fraction is not None else float(bucket.get("remainingPercent", 100))
             points = [p for p in snapshots.get(bid, []) if isinstance(p, list) and len(p) == 2 and now - p[0] < 6 * 3600]
             points.append([now, pct])
             snapshots[bid] = points
             start = len(points) - 1
-            while start > 0 and points[start - 1][1] >= points[start][1] - 0.5:
+            while start > 0 and points[start - 1][1] >= points[start][1] - 1.0:
                 start -= 1
             span_h = (points[-1][0] - points[start][0]) / 3600.0
             drop = points[start][1] - points[-1][1]
