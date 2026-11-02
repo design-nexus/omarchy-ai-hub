@@ -1535,7 +1535,7 @@ BarWidget {
       Repeater {
         model: [
           { key: "enableCodex", label: "Codex" },
-          { key: "enableXsi", label: "XSI (Grok + Cursor)" },
+          { key: "enableXsi", label: "xAI (Grok + Cursor)" },
           { key: "enableAntigravity", label: "Antigravity" },
           { key: "enableClaude", label: "Claude Code" },
           { key: "enableCopilot", label: "Copilot" },

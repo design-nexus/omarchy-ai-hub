@@ -3,7 +3,7 @@
 
 Every result includes availability, activity, quota buckets, local usage, sessions,
 errors, and presentation metadata. Network quota is not estimated for Claude,
-Copilot, or Muse. XSI is Grok and Cursor together: their plans share one quota
+Copilot, or Muse. xAI is Grok and Cursor together: their plans share one quota
 pool, so it shows Grok's billing once and merges both CLIs' stats and sessions.
 
 Each provider's scanner is imported and called in this process; `busy` tells the
@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 META = {
     "codex": ("Codex", "#22c7b8", "codex_usage_scanner", "codex", "OpenAI"),
-    "xsi": ("XSI", "#a855f7", "", "grok", "xAI"),
+    "xsi": ("xAI", "#a855f7", "", "grok", "xAI"),
     "antigravity": ("Antigravity", "#3b82f6", "antigravity_usage_scanner", "agy", "Google DeepMind"),
     "claude": ("Claude Code", "#f97316", "claude_usage_scanner", "claude", "Anthropic"),
     "copilot": ("Copilot", "#1f6feb", "copilot_usage_scanner", "copilot", "GitHub"),
@@ -196,7 +196,7 @@ def merge_xsi(force):
         "usageStatusText": "" if has_stats else "No Grok or Cursor activity found",
         "authHelpText": " · ".join(help_lines),
         "error": " · ".join(errors),
-        "display": {"name": "XSI", "color": META["xsi"][1], "executable": newest_exe},
+        "display": {"name": META["xsi"][0], "color": META["xsi"][1], "executable": newest_exe},
     })
     return data
 
