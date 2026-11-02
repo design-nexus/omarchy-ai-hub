@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -16,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from common import FetchGate, LogCache, apply_forecasts, cache_age_iso, cache_dir, date_string, local_date_from_timestamp, read_configured_model, recent_date_strings, sanitize_plain_text
-from urllib.parse import unquote
+from urllib.parse import unquote, urlencode
 
 
 def default_base_dir() -> Path:
@@ -171,35 +174,128 @@ def kill_session(cid: str, base_dir: Path) -> bool:
         return False
 
 
-def access_token(auth_path: Path) -> tuple[str, str]:
-    if not auth_path.exists():
-        return "", ""
+def auth_entry(auth_path: Path) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """auth.json, and the name and contents of its first entry holding a token."""
     try:
-        with open(auth_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                return "", ""
-            for entry in data.values():
-                if not isinstance(entry, dict):
-                    continue
-                token = str(entry.get("key") or "").strip()
-                if token:
-                    return token, str(entry.get("expires_at") or "")
-    except Exception:
-        pass
-    return "", ""
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, "", {}
+    if isinstance(data, dict):
+        for name, entry in data.items():
+            if isinstance(entry, dict) and str(entry.get("key") or "").strip():
+                return data, name, entry
+    return {}, "", {}
 
 
-def token_expired(expires_at: str) -> bool:
+def token_expired(expires_at: str, margin_sec: float = 0) -> bool:
     if not expires_at:
         return False
     try:
         parsed = dt.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.timezone.utc)
-        return parsed <= dt.datetime.now(dt.timezone.utc)
+        return parsed <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=margin_sec)
     except Exception:
         return False
+
+
+# Renew this long before the access token lapses (it lasts about six hours).
+REFRESH_MARGIN_SEC = 300
+AUTH_LOCK_TIMEOUT_SEC = 5
+LOGIN_AGAIN = "Grok sign-in is no longer valid. Run `grok login`."
+
+
+@contextlib.contextmanager
+def auth_lock(base_dir: Path):
+    """Hold ~/.grok/auth.json.lock, the flock the Grok CLI takes before it renews or saves a sign-in."""
+    fd = os.open(base_dir / "auth.json.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + AUTH_LOCK_TIMEOUT_SEC
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Grok is busy with its sign-in; try again shortly")
+                time.sleep(0.1)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{os.getpid()}:{int(time.time())}".encode(), 0)
+        yield
+    finally:
+        os.close(fd)
+
+
+def token_endpoint(issuer: str) -> str:
+    try:
+        with urllib.request.urlopen(issuer + "/.well-known/openid-configuration", timeout=10) as resp:
+            endpoint = str(json.loads(resp.read().decode("utf-8")).get("token_endpoint") or "")
+            if endpoint.startswith("https://"):
+                return endpoint
+    except (OSError, ValueError, AttributeError):
+        pass
+    return issuer + "/oauth2/token"
+
+
+def save_auth(auth_path: Path, data: dict[str, Any]) -> None:
+    """Replace auth.json in one step, private, formatted as the Grok CLI writes it."""
+    fd, tmp = tempfile.mkstemp(dir=auth_path.parent, prefix=".auth.json.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(json.dumps(data, indent=2, ensure_ascii=False))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, auth_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def refresh_access_token(base_dir: Path, rejected: str = "") -> tuple[str, str]:
+    """(token, error): a working access token, renewed from the stored refresh
+    token when the current one is about to lapse or equals `rejected`."""
+    auth_path = base_dir / "auth.json"
+    try:
+        with auth_lock(base_dir):
+            data, name, entry = auth_entry(auth_path)
+            if not entry:
+                return "", "No Grok authentication token found. Run `grok login`."
+            token = str(entry["key"]).strip()
+            # Grok may have renewed it while we waited for the lock.
+            if token != rejected and not token_expired(str(entry.get("expires_at") or ""), REFRESH_MARGIN_SEC):
+                return token, ""
+            refresh = str(entry.get("refresh_token") or "")
+            issuer = str(entry.get("oidc_issuer") or "").rstrip("/")
+            client_id = str(entry.get("oidc_client_id") or "")
+            if not (refresh and client_id and issuer.startswith("https://")):
+                return "", LOGIN_AGAIN
+
+            req = urllib.request.Request(
+                token_endpoint(issuer),
+                data=urlencode({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": client_id}).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            except urllib.error.HTTPError as error:
+                return "", LOGIN_AGAIN if error.code in (400, 401, 403) else f"Grok sign-in refresh returned status {error.code}"
+
+            token = str(payload.get("access_token") or "").strip() if isinstance(payload, dict) else ""
+            if not token:
+                return "", "Grok sign-in refresh returned no token"
+            lifetime = int(payload.get("expires_in") or 3600)
+            entry["key"] = token
+            entry["expires_at"] = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=lifetime)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if payload.get("refresh_token"):
+                entry["refresh_token"] = str(payload["refresh_token"])
+            data[name] = entry
+            save_auth(auth_path, data)
+            return token, ""
+    except (OSError, ValueError, TimeoutError) as exc:
+        return "", str(exc) or "Grok sign-in refresh failed"
 
 
 BILLING_ENDPOINT = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
@@ -233,9 +329,8 @@ def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[s
     if blocked:
         return cached_groups(blocked)
 
-    auth_file = base_dir / "auth.json"
-    token, expires_at = access_token(auth_file)
-    if not token:
+    _, _, entry = auth_entry(base_dir / "auth.json")
+    if not entry:
         if cache_file.exists():
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
@@ -245,26 +340,35 @@ def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[s
                 pass
         return [], "", "No Grok authentication token found. Run `grok login`."
 
-    if token_expired(expires_at):
-        if cache_file.exists():
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return data.get("groups", []), data.get("tierLabel", "SuperGrok"), "Sign-in expired"
-            except Exception:
-                pass
+    token = str(entry["key"]).strip()
+    if token_expired(str(entry.get("expires_at") or ""), REFRESH_MARGIN_SEC):
+        token, error = refresh_access_token(base_dir)
+        if not token:
+            gate.failed(error)
+            return cached_groups(error)
 
-    try:
+    def request_billing(bearer: str) -> Any:
         req = urllib.request.Request(
             BILLING_ENDPOINT,
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {bearer}",
                 "Accept": "application/json",
             },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read()
-            payload = json.loads(body.decode("utf-8", errors="replace"))
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    try:
+        try:
+            payload = request_billing(token)
+        except urllib.error.HTTPError as error:
+            if error.code not in (401, 403):
+                raise
+            token, refresh_error = refresh_access_token(base_dir, rejected=token)
+            if not token:
+                gate.failed(refresh_error)
+                return cached_groups(refresh_error)
+            payload = request_billing(token)
         gate.succeeded()
 
         config = payload.get("config") if isinstance(payload, dict) else {}
@@ -329,10 +433,9 @@ def fetch_grok_billing(base_dir: Path, force: bool = False) -> tuple[list[dict[s
 
         return groups, tier, ""
     except urllib.error.HTTPError as error:
-        message = ("Grok sign-in is no longer valid. Run `grok login`." if error.code in (401, 403)
-                   else f"Grok billing returned status {error.code}")
+        message = LOGIN_AGAIN if error.code in (401, 403) else f"Grok billing returned status {error.code}"
         gate.failed(message)
-        return [], "", message
+        return cached_groups(message)
     except Exception as exc:
         gate.failed(str(exc))
         return cached_groups(str(exc))

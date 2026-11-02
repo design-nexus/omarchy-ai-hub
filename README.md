@@ -70,7 +70,7 @@ Each tab keeps its own keys. The ones worth knowing:
 
 Every tab's polling runs once for the whole shell, however many monitors have a bar.
 
-- **Usage:** each agent is rescanned every minute (the Usage settings change this), and every 10 seconds while you are working in it. Each scan reads only what the agent has written since the last one.
+- **Usage:** each agent is rescanned every minute (the Usage settings change this), and every 10 seconds while you are working in it. Each scan reads only what the agent has written since the last one. When Grok's sign-in is about to lapse, the hub renews it from the refresh token in `~/.grok/auth.json`, so xAI quotas keep updating without opening Grok; only a revoked sign-in needs `grok login`.
 - **Live:** herdr is asked every 20 seconds, every 5 while an agent is working or waiting on you, and every 3 while the tab is open or a card is pinned.
 - **Local:** while the tab is closed, the hub only checks whether each server is up; models and resource use are read while it is open.
 
